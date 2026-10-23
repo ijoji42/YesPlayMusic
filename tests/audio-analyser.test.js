@@ -46,6 +46,7 @@ const CONTRACT_VARS = [
   '--react-drift',
   '--react-glow',
   '--react-mid',
+  '--react-power',
   '--react-pulse',
   '--react-saturate',
   '--react-scale',
@@ -178,7 +179,7 @@ describe('audioAnalyser', () => {
       // 这里只断言方向和量级，不钉死具体数值。
       const peak = analyser.mapFrameToVars({ level: 255, pulse: 1 }, ALL_ON);
       const blur = parseFloat(peak['--react-blur']);
-      assert.ok(blur >= 28 && blur <= 50, `blur out of range: ${blur}`);
+      assert.ok(blur >= 20 && blur <= 50, `blur out of range: ${blur}`);
       assert.ok(parseFloat(peak['--react-drift']) <= 72);
       assert.ok(parseFloat(peak['--react-glow']) <= 0.75);
       assert.ok(parseFloat(peak['--react-scale']) <= 1.13);
@@ -300,6 +301,39 @@ describe('audioAnalyser', () => {
       assert.equal(typeof frame.agc.span, 'number');
       assert.equal(typeof frame.smooth, 'number');
       assert.equal(typeof frame.bassAmp, 'number');
+    });
+
+    // 分频段变量是纯能量，不乘 intensity；视觉层靠 --react-power 统一缩放。
+    // 少了这一条，用户拖「强度」滑杆时光斑 opacity 完全不响应。
+    it('exposes intensity as --react-power for the visual layer', () => {
+      const full = analyser.mapFrameToVars({ level: 200, pulse: 0 }, ALL_ON);
+      assert.equal(full['--react-power'], '1');
+
+      const weak = analyser.mapFrameToVars(
+        { level: 200, pulse: 0 },
+        { ...ALL_ON, intensity: 40 }
+      );
+      assert.equal(weak['--react-power'], '0.4');
+
+      // 能量本身不跟着 intensity 变，缩放交给 CSS
+      const bands = analyser.mapFrameToVars(
+        { level: 200, pulse: 0, bassAmp: 0.8 },
+        { ...ALL_ON, intensity: 10 }
+      );
+      assert.equal(bands['--react-bass'], '0.8');
+    });
+
+    // 默认预设 intensity 只有 55，系数必须留够行程，否则「律动没作用」会复发。
+    it('keeps at least 12px of blur travel at the shipped default intensity', () => {
+      const soft = analyser.REACTIVE_PRESETS.soft;
+      const quiet = analyser.mapFrameToVars({ level: 0, pulse: 0 }, soft);
+      const loud = analyser.mapFrameToVars({ level: 255, pulse: 0 }, soft);
+      const travel =
+        parseFloat(quiet['--react-blur']) - parseFloat(loud['--react-blur']);
+      assert.ok(
+        travel >= 12,
+        `blur travel at intensity ${soft.intensity} is only ${travel}px`
+      );
     });
 
     it('migrates the legacy hue dimension to drift', () => {

@@ -395,7 +395,7 @@ function pickLevel(bands, band) {
  *
  * 变量契约（视觉层照此消费，名字和单位都不要改）：
  *   --react-scale       1 ~ 1.13      无单位
- *   --react-blur        50px ~ 28px   能量越高越清晰（聚焦感），不是越大越糊
+ *   --react-blur        50px ~ 20px   能量越高越清晰（聚焦感），不是越大越糊
  *   --react-brightness  0.82 ~ 1.12   乘数，不是增量
  *   --react-saturate    1 ~ 1.45      无单位
  *   --react-drift       0px ~ 72px    位移幅度，方向由 CSS 按层决定
@@ -404,9 +404,12 @@ function pickLevel(bands, band) {
  *                                     不能假设它能淡到全透明（深色主题下那层白
  *                                     本身的 alpha 要压住，否则会像蒙雾）
  *   --react-pulse       0 ~ 1         节拍脉冲
- *   --react-bass        0 ~ 1         AGC 后的低频能量
- *   --react-mid         0 ~ 1         AGC 后的中频能量
- *   --react-treble      0 ~ 1         AGC 后的高频能量
+ *   --react-bass        0 ~ 1         AGC 后的低频能量（**纯能量，未乘 intensity**）
+ *   --react-mid         0 ~ 1         AGC 后的中频能量（同上）
+ *   --react-treble      0 ~ 1         AGC 后的高频能量（同上）
+ *   --react-power       0 ~ 1         intensity/100，供视觉层对不随 intensity
+ *                                     变化的原始能量做统一缩放，例如
+ *                                     calc(var(--react-bass) * var(--react-power))
  *
  * 区间按「AGC 之后 amp 真的能跑满 0~1」重新定过：旧的 20px/26px 区间是在
  * amp 被钉死在 0.9 的前提下调的，现在 amp 会真的摆动，同样的系数会显得过冲，
@@ -436,12 +439,16 @@ export function mapFrameToVars(frame, cfg) {
   vars['--react-scale'] = dims.scale
     ? num(1 + amp * power * 0.1 + pulseValue * power * 0.03, 4)
     : '1';
-  // 反向：能量越高 blur 越小。满功率时 50px → 28px。
-  // 这 22px 不只是「清晰度」，它同时是视差能被看见的前提：blur 降到 46px 以下
+  // 反向：能量越高 blur 越小。满功率时 50px → 20px。
+  // 这 30px 不只是「清晰度」，它同时是视差能被看见的前提：blur 降到 46px 以下
   // 边缘才重新出现，drift 才有可追踪的对象；blur 不动时再怎么加大位移，
   // 看到的也只是「一片糊移动得更大」。
+  // 系数 30（而不是 22）：默认预设 intensity 只有 55，power=0.55，系数 22 时
+  // 上限只有 12.1px，实测只能拿到 9.8px；30 把上限抬到 16.5px，实测约 13.4px。
+  // 预设默认值不动 —— 改 soft.intensity 会让存量用户的 lyricsReactive 被判成
+  // custom、设置页四个预设全灰。
   vars['--react-blur'] = dims.blur
-    ? num(BASE_BLUR - amp * power * 22, 1) + 'px'
+    ? num(BASE_BLUR - amp * power * 30, 1) + 'px'
     : BASE_BLUR + 'px';
   // 0.82 起步而不是 1：能量低时先压暗，给「亮起来」留出上行空间。
   vars['--react-brightness'] = dims.brightness
@@ -462,6 +469,9 @@ export function mapFrameToVars(frame, cfg) {
   vars['--react-bass'] = num(bandAmp('bassAmp'), 3);
   vars['--react-mid'] = num(bandAmp('midAmp'), 3);
   vars['--react-treble'] = num(bandAmp('trebleAmp'), 3);
+  // 分频段变量是**纯能量**，不乘 intensity；视觉层用它统一缩放，
+  // 否则用户在设置里拖「强度」滑杆时光斑 opacity 完全不响应。
+  vars['--react-power'] = num(power, 2);
 
   return vars;
 }
