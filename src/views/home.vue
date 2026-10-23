@@ -1,5 +1,9 @@
 <template>
   <div>
+    <!-- 「继续收听」完全来自 localStorage，零网络请求，
+         所以放在骨架屏之外：冷启动第一帧就有内容可看。
+         高度固定，下面的骨架屏 / 真实内容加载完成时不会引起跳动。 -->
+    <ContinueListening ref="continueListening" />
     <!-- 首屏骨架：show 为 false 时原来是一片纯白（最长约 1 秒），
          用户无法判断应用是活着还是卡死了。骨架屏让等待可见，
          同时避免内容突然出现时的布局跳动。 -->
@@ -94,13 +98,20 @@ import { getRecommendPlayList } from '@/utils/playList';
 import NProgress from 'nprogress';
 import { mapState } from 'vuex';
 import CoverRow from '@/components/CoverRow.vue';
+import ContinueListening from '@/components/ContinueListening.vue';
 import FMCard from '@/components/FMCard.vue';
 import DailyTracksCard from '@/components/DailyTracksCard.vue';
 import Skeleton from '@/components/Skeleton.vue';
 
 export default {
   name: 'Home',
-  components: { CoverRow, FMCard, DailyTracksCard, Skeleton },
+  components: {
+    CoverRow,
+    ContinueListening,
+    FMCard,
+    DailyTracksCard,
+    Skeleton,
+  },
   data() {
     return {
       show: false,
@@ -124,6 +135,10 @@ export default {
   },
   activated() {
     this.loadData();
+    // keep-alive 返回首页时刷新「继续收听」：离开期间可能又听了别的歌
+    if (this.$refs.continueListening) {
+      this.$refs.continueListening.refresh();
+    }
     this.$parent.$refs.scrollbar.restorePosition();
   },
   methods: {
