@@ -353,6 +353,7 @@
         </div>
       </div>
 
+      <div id="settings-anchor-integrations" class="settings-anchor"></div>
       <section v-if="isElectron" class="unm-configuration">
         <h3>UnblockNeteaseMusic</h3>
         <div class="item">
