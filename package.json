@@ -1,6 +1,6 @@
 {
   "name": "yesplaymusic",
-  "version": "0.4.11",
+  "version": "0.4.12",
   "private": true,
   "description": "A third party music player for Netease Music",
   "author": "qier222<qier222@outlook.com>",
@@ -36,7 +36,6 @@
     "crypto-js": "^4.0.0",
     "dayjs": "^1.8.36",
     "dexie": "^3.0.3",
-    "discord-rich-presence": "^0.0.8",
     "electron": "^13.6.7",
     "electron-builder": "^23.0.0",
     "electron-context-menu": "^3.1.2",
@@ -131,5 +130,8 @@
     "hooks": {
       "pre-commit": "npm run prettier"
     }
+  },
+  "optionalDependencies": {
+    "discord-rich-presence": "^0.0.8"
   }
 }

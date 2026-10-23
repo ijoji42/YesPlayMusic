@@ -319,22 +319,39 @@ export default {
       if (this.liked.songsWithDetails.length > 0) {
         NProgress.done();
         this.show = true;
-        this.$store.dispatch('fetchLikedSongsWithDetails');
+        this.$store.dispatch('fetchLikedSongsWithDetails').catch(error => {
+          console.warn('[library] refresh liked songs failed', error);
+        });
         this.getRandomLyric();
       } else {
-        this.$store.dispatch('fetchLikedSongsWithDetails').then(() => {
-          NProgress.done();
-          this.show = true;
-          this.getRandomLyric();
-        });
+        // 原实现没有 catch：首次加载失败就永久白屏 + 进度条一直转
+        this.$store
+          .dispatch('fetchLikedSongsWithDetails')
+          .then(() => {
+            this.getRandomLyric();
+          })
+          .catch(error => {
+            console.warn('[library] failed to load liked songs', error);
+          })
+          .finally(() => {
+            NProgress.done();
+            this.show = true;
+          });
       }
-      this.$store.dispatch('fetchLikedSongs');
-      this.$store.dispatch('fetchLikedPlaylist');
-      this.$store.dispatch('fetchLikedAlbums');
-      this.$store.dispatch('fetchLikedArtists');
-      this.$store.dispatch('fetchLikedMVs');
-      this.$store.dispatch('fetchCloudDisk');
-      this.$store.dispatch('fetchPlayHistory');
+
+      // 这些是并行补充数据，单个失败不应该影响整页可用性
+      const safeDispatch = type => {
+        this.$store.dispatch(type).catch(error => {
+          console.warn(`[library] ${type} failed`, error);
+        });
+      };
+      safeDispatch('fetchLikedSongs');
+      safeDispatch('fetchLikedPlaylist');
+      safeDispatch('fetchLikedAlbums');
+      safeDispatch('fetchLikedArtists');
+      safeDispatch('fetchLikedMVs');
+      safeDispatch('fetchCloudDisk');
+      safeDispatch('fetchPlayHistory');
     },
     playLikedSongs() {
       this.$store.state.player.playPlaylistByID(

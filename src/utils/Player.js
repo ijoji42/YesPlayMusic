@@ -8,13 +8,42 @@ import store from '@/store';
 import { isAccountLoggedIn } from '@/utils/auth';
 import { cacheTrackSource, getTrackSource } from '@/utils/db';
 import { isCreateMpris, isCreateTray } from '@/utils/platform';
-import { Howl, Howler } from 'howler';
+import { Howl } from 'howler';
 import shuffle from 'lodash/shuffle';
 import { decode as base642Buffer } from '@/utils/base64';
 
 const PLAY_PAUSE_FADE_DURATION = 200;
+// 切歌交叉淡化时长，用于掩盖 html5 音频源切换时的解码空隙
+const TRACK_CROSSFADE_DURATION = 160;
+// 播放器状态持久化的合并窗口：同一窗口内的高频变更只序列化一次
+const PERSIST_THROTTLE = 800;
+// 进度持久化间隔（独立的轻量 key，不参与 player 快照序列化）
+const PROGRESS_SAVE_INTERVAL = 2000;
 
 const INDEX_IN_PLAY_NEXT = -1;
+
+/**
+ * 需要跨会话保留的播放器字段。
+ * 显式白名单而非遍历实例：避免把 howler 引用、blob 记录、定时器句柄
+ * 这类运行时对象写进 localStorage，也避免列表很长时产生无意义的序列化开销。
+ */
+const PERSISTED_KEYS = [
+  '_enabled',
+  '_repeatMode',
+  '_shuffle',
+  '_reversed',
+  '_volume',
+  '_volumeBeforeMuted',
+  '_list',
+  '_current',
+  '_shuffledList',
+  '_shuffledCurrent',
+  '_playlistSource',
+  '_currentTrack',
+  '_playNextList',
+  '_personalFMTrack',
+  '_personalFMNextTrack',
+];
 
 /**
  * @readonly
@@ -35,11 +64,6 @@ const delay = ms =>
       resolve('');
     }, ms);
   });
-const excludeSaveKeys = [
-  '_playing',
-  '_personalFMLoading',
-  '_personalFMNextLoading',
-];
 
 function setTitle(track) {
   document.title = track
@@ -70,6 +94,9 @@ export default class {
     this._volumeBeforeMuted = 1; // 用于保存静音前的音量
     this._personalFMLoading = false; // 是否正在私人FM中加载新的track
     this._personalFMNextLoading = false; // 是否正在缓存私人FM的下一首歌曲
+    this._lastSeekAt = 0; // 最近一次用户 seek 的时间戳
+    this._lastProgressSave = 0; // 最近一次进度落盘的时间戳
+    this._desiredPlaying = false; // 用户期望的播放状态（用于淡入淡出竞态判定）
 
     // 播放信息
     this._list = []; // 播放列表
@@ -93,14 +120,31 @@ export default class {
      */
     this.createdBlobRecords = [];
 
+    // 持久化调度（不参与序列化）
+    this._persistDirty = false;
+    this._persistTimer = null;
+
     // howler (https://github.com/goldfire/howler.js)
     this._howler = null;
     Object.defineProperty(this, '_howler', {
       enumerable: false,
     });
 
+    // 上一个 howler 实例，切歌时用于交叉淡化后卸载
+    this._fadingHowler = null;
+
     // init
     this._init();
+
+    if (typeof window !== 'undefined') {
+      // 关闭 / 隐藏页面时把合并窗口内未落盘的状态立即写掉
+      window.addEventListener('pagehide', () =>
+        this._flushSelfToLocalStorage()
+      );
+      window.addEventListener('beforeunload', () =>
+        this._flushSelfToLocalStorage()
+      );
+    }
 
     window.yesplaymusic = {};
     window.yesplaymusic.player = this;
@@ -202,6 +246,11 @@ export default class {
   }
   set progress(value) {
     if (this._howler) {
+      // 与 seek() 保持一致：记录 seek 时间并立刻回写进度。
+      // 原实现只调 _howler.seek()，不更新 _progress 也不打时间戳，
+      // 导致歌词页的进度条松手后会被 1 秒一次的采样「弹回」旧位置。
+      this._lastSeekAt = Date.now();
+      this._progress = value;
       this._howler.seek(value);
       if (isCreateMpris) {
         ipcRenderer?.send('seeked', this._howler.seek());
@@ -218,9 +267,18 @@ export default class {
 
     if (this._enabled) {
       // 恢复当前播放歌曲
-      this._replaceCurrentTrack(this.currentTrackID, false).then(() => {
-        this._howler?.seek(localStorage.getItem('playerCurrentTrackTime') ?? 0);
-      }); // update audio source and init howler
+      this._replaceCurrentTrack(this.currentTrackID, false)
+        .then(() => {
+          const savedTime = Number(
+            localStorage.getItem('playerCurrentTrackTime')
+          );
+          if (Number.isFinite(savedTime) && savedTime > 0) {
+            this._howler?.seek(savedTime);
+          }
+        })
+        .catch(error => {
+          console.warn('[Player] failed to restore last track', error);
+        }); // update audio source and init howler
       this._initMediaSession();
     }
 
@@ -247,14 +305,28 @@ export default class {
   }
   _setIntervals() {
     // 同步播放进度
-    // TODO: 如果 _progress 在别的地方被改变了，
-    // 这个定时器会覆盖之前改变的值，是bug
-    setInterval(() => {
+    // 修掉了原先的覆盖问题：用户刚 seek 过的 1.2s 内不用定时器采样值覆盖，
+    // 否则拖动进度条会被每秒一次的采样「弹回去」。
+    this._progressTimer = setInterval(() => {
       if (this._howler === null) return;
-      this._progress = this._howler.seek();
-      localStorage.setItem('playerCurrentTrackTime', this._progress);
+      if (Date.now() - this._lastSeekAt < 1200) return;
+
+      const progress = this._howler.seek();
+      if (typeof progress !== 'number' || Number.isNaN(progress)) return;
+      this._progress = progress;
+
+      // 进度单独用轻量 key 持久化，且降频到 2s 一次，避免每秒同步写盘
+      const now = Date.now();
+      if (now - this._lastProgressSave >= PROGRESS_SAVE_INTERVAL) {
+        this._lastProgressSave = now;
+        try {
+          localStorage.setItem('playerCurrentTrackTime', String(progress));
+        } catch (e) {
+          /* ignore quota errors */
+        }
+      }
       if (isCreateMpris) {
-        ipcRenderer?.send('playerCurrentTrackTime', this._progress);
+        ipcRenderer?.send('playerCurrentTrackTime', progress);
       }
     }, 1000);
   }
@@ -340,17 +412,44 @@ export default class {
     }
   }
   _playAudioSource(source, autoplay = true) {
-    Howler.unload();
-    this._howler = new Howl({
+    const previous = this._howler;
+
+    let howl;
+    howl = new Howl({
       src: [source],
       html5: true,
       preload: true,
       format: ['mp3', 'flac'],
       onend: () => {
+        // 已经被替换掉的实例（交叉淡化中的旧实例）不再触发切歌
+        if (this._howler !== howl) return;
         this._nextTrackCallback();
       },
     });
-    this._howler.on('loaderror', (_, errCode) => {
+    this._howler = howl;
+
+    // 交叉淡化：旧实例淡出后单独卸载。
+    // 不使用 Howler.unload()（全局卸载会连带销毁预加载实例），
+    // 也不会在切歌瞬间硬切造成可听见的爆音。
+    if (previous) {
+      try {
+        const fromVolume = previous.volume();
+        previous.fade(fromVolume, 0, TRACK_CROSSFADE_DURATION);
+        setTimeout(() => {
+          try {
+            previous.unload();
+          } catch (e) {
+            /* already unloaded */
+          }
+        }, TRACK_CROSSFADE_DURATION + 60);
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    howl.on('loaderror', (_, errCode) => {
+      // 旧实例的加载错误不再影响当前播放
+      if (this._howler !== howl) return;
       // https://developer.mozilla.org/en-US/docs/Web/API/MediaError/code
       // code 3: MEDIA_ERR_DECODE
       if (errCode === 3) {
@@ -379,6 +478,8 @@ export default class {
         setTitle(this._currentTrack);
       }
       setTrayLikeState(store.state.liked.songs.includes(this.currentTrack.id));
+    } else {
+      howl.volume(this.volume);
     }
     this.setOutputDevice();
   }
@@ -386,16 +487,19 @@ export default class {
     // Create a new object URL.
     const source = URL.createObjectURL(new Blob([data]));
 
-    // Clean up the previous object URLs since we've created a new one.
-    // Revoke object URLs can release the memory taken by a Blob,
-    // which occupied a large proportion of memory.
-    for (const url in this.createdBlobRecords) {
-      URL.revokeObjectURL(url);
+    // 原实现用 `for...in` 遍历数组，拿到的是下标字符串（"0"、"1"），
+    // URL.revokeObjectURL("0") 什么都不会释放，Blob 内存持续泄漏；
+    // 而且每次都把上一次的 URL 全部 revoke，正在播放的那一个也会被回收。
+    // 现在保留最近两个实例（当前 + 交叉淡化中的），只回收更早的。
+    while (this.createdBlobRecords.length > 2) {
+      const stale = this.createdBlobRecords.shift();
+      try {
+        URL.revokeObjectURL(stale);
+      } catch (e) {
+        /* ignore */
+      }
     }
-
-    // Then, we replace the createBlobRecords with new one with
-    // our newly created object URL.
-    this.createdBlobRecords = [source];
+    this.createdBlobRecords.push(source);
 
     return source;
   }
@@ -508,17 +612,36 @@ export default class {
     if (autoplay && this._currentTrack.name) {
       this._scrobble(this.currentTrack, this._howler?.seek());
     }
-    return getTrackDetail(id).then(data => {
-      const track = data.songs[0];
-      this._currentTrack = track;
-      this._updateMediaSessionMetaData(track);
-      return this._replaceCurrentTrackAudio(
-        track,
-        autoplay,
-        true,
-        ifUnplayableThen
-      );
-    });
+
+    // 序号守卫：连续点「下一首」时，先发出的详情请求可能后返回，
+    // 没有守卫就会「跳回去再跳回来」。只有最后一次请求的结果会被应用。
+    this._replaceSeq = (this._replaceSeq || 0) + 1;
+    const seq = this._replaceSeq;
+
+    return getTrackDetail(id)
+      .then(data => {
+        if (seq !== this._replaceSeq) return false;
+        const track = data?.songs?.[0];
+        if (!track) {
+          store.dispatch('showToast', `无法获取歌曲 ${id} 的信息`);
+          return false;
+        }
+        this._currentTrack = track;
+        this._updateMediaSessionMetaData(track);
+        return this._replaceCurrentTrackAudio(
+          track,
+          autoplay,
+          true,
+          ifUnplayableThen
+        );
+      })
+      .catch(error => {
+        if (seq !== this._replaceSeq) return false;
+        console.warn('[Player] failed to load track detail', id, error);
+        store.dispatch('showToast', '加载歌曲失败，请检查网络');
+        this._setPlaying(false);
+        return false;
+      });
   }
   /**
    * @returns 是否成功加载音频，并使用加载完成的音频替换了howler实例
@@ -646,19 +769,33 @@ export default class {
       return ipcRenderer?.send('metadata', metadata);
     }
 
-    let lyricContent = await getLyric(track.id);
-
-    if (!lyricContent.lrc || !lyricContent.lrc.lyric) {
+    let lyricContent = null;
+    try {
+      lyricContent = await getLyric(track.id);
+    } catch (e) {
       return ipcRenderer?.send('metadata', metadata);
     }
+
+    if (!lyricContent?.lrc?.lyric) {
+      return ipcRenderer?.send('metadata', metadata);
+    }
+
+    // 原实现每切一首歌就 ipcRenderer.on 一次且从不移除，
+    // 长会话下监听器会累积到上千个，每次事件都要遍历全部回调。
+    // 这里保证同一时刻最多只有一个待处理的监听器。
+    if (this._mprisListener) {
+      ipcRenderer.removeListener('saveLyricFinished', this._mprisListener);
+    }
+    this._mprisListener = () => {
+      ipcRenderer.removeListener('saveLyricFinished', this._mprisListener);
+      this._mprisListener = null;
+      ipcRenderer?.send('metadata', metadata);
+    };
+    ipcRenderer.on('saveLyricFinished', this._mprisListener);
 
     ipcRenderer.send('sendLyrics', {
       track,
       lyrics: lyricContent.lrc.lyric,
-    });
-
-    ipcRenderer.on('saveLyricFinished', () => {
-      ipcRenderer?.send('metadata', metadata);
     });
   }
   _updateMediaSessionPositionState() {
@@ -732,7 +869,33 @@ export default class {
   }
 
   appendTrack(trackID) {
-    this.list.append(trackID);
+    // Array 没有 append 方法，原实现在这里必然抛 TypeError
+    const list = this.list;
+    if (!Array.isArray(list)) return;
+    list.push(trackID);
+    this.saveSelfToLocalStorage();
+  }
+  /**
+   * 追加到播放列表末尾。
+   *
+   * search.vue 的搜索结果点击直接调用了 player.appendTrackToPlayerList(track, true)，
+   * 但 Player 上没有这个方法、store 里也没有同名 mutation，
+   * 点击即 TypeError。这里补上实现。
+   *
+   * @param {object} track 歌曲详情对象
+   * @param {boolean} playNow 是否立即播放
+   */
+  appendTrackToPlayerList(track, playNow = false) {
+    if (!track || track.id === undefined || track.id === null) return;
+    if (!this._list.includes(track.id)) this._list.push(track.id);
+    if (this._shuffle && !this._shuffledList.includes(track.id)) {
+      this._shuffledList.push(track.id);
+    }
+    this.saveSelfToLocalStorage();
+    if (playNow) {
+      this.current = this.list.indexOf(track.id);
+      this._replaceCurrentTrack(track.id);
+    }
   }
   playNextTrack() {
     // TODO: 切换歌曲时增加加载中的状态
@@ -807,33 +970,95 @@ export default class {
     );
     return true;
   }
-  saveSelfToLocalStorage() {
-    let player = {};
-    for (let [key, value] of Object.entries(this)) {
-      if (excludeSaveKeys.includes(key)) continue;
-      player[key] = value;
+  /**
+   * 标记播放器状态需要持久化。
+   *
+   * 原实现每次赋值都同步序列化整个实例（含上千个 trackID 的播放列表），
+   * 播放进度每秒触发一次就是每秒一次大对象序列化 + 同步写盘。
+   * 现在改为脏标记 + 合并写入，窗口内的多次变更只序列化一次。
+   *
+   * @param {boolean} immediate 是否跳过合并窗口立即落盘
+   */
+  saveSelfToLocalStorage(immediate = false) {
+    this._persistDirty = true;
+    if (immediate) {
+      this._flushSelfToLocalStorage();
+      return;
+    }
+    if (this._persistTimer !== null) return;
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null;
+      this._flushSelfToLocalStorage();
+    }, PERSIST_THROTTLE);
+  }
+  _flushSelfToLocalStorage() {
+    if (this._persistTimer !== null) {
+      clearTimeout(this._persistTimer);
+      this._persistTimer = null;
+    }
+    if (!this._persistDirty) return;
+    this._persistDirty = false;
+
+    const snapshot = {};
+    for (const key of PERSISTED_KEYS) {
+      if (this[key] !== undefined) snapshot[key] = this[key];
     }
 
-    localStorage.setItem('player', JSON.stringify(player));
+    try {
+      localStorage.setItem('player', JSON.stringify(snapshot));
+    } catch (e) {
+      console.warn('[Player] failed to persist state', e);
+    }
   }
 
   pause() {
-    this._howler?.fade(this.volume, 0, PLAY_PAUSE_FADE_DURATION);
+    // 记录用户意图：淡出期间如果又点了播放，这一次暂停要放弃，
+    // 否则会出现「点了播放但 200ms 后被暂停」的竞态。
+    this._desiredPlaying = false;
+    const howl = this._howler;
+    if (!howl) {
+      this._setPlaying(false);
+      return;
+    }
 
-    this._howler?.once('fade', () => {
-      this._howler?.pause();
+    howl.fade(howl.volume(), 0, PLAY_PAUSE_FADE_DURATION);
+    howl.once('fade', () => {
+      if (this._howler !== howl) return;
+      if (this._desiredPlaying) {
+        // 用户在淡出过程中恢复了播放，把音量淡回去
+        howl.fade(howl.volume(), this.volume, PLAY_PAUSE_FADE_DURATION);
+        this._setPlaying(true);
+        return;
+      }
+      howl.pause();
       this._setPlaying(false);
       setTitle(null);
       this._pauseDiscordPresence(this._currentTrack);
     });
   }
   play() {
-    if (this._howler?.playing()) return;
+    this._desiredPlaying = true;
+    const howl = this._howler;
+    if (!howl) return;
 
-    this._howler?.play();
+    // 已经处于播放中（可能正在淡出暂停）：只需把音量淡回来，不要重复 play
+    if (howl.playing()) {
+      howl.fade(howl.volume(), this.volume, PLAY_PAUSE_FADE_DURATION);
+      this._setPlaying(true);
+      if (this._currentTrack.name) {
+        setTitle(this._currentTrack);
+      }
+      return;
+    }
 
-    this._howler?.once('play', () => {
-      this._howler?.fade(0, this.volume, PLAY_PAUSE_FADE_DURATION);
+    howl.play();
+
+    howl.once('play', () => {
+      if (this._howler !== howl) return;
+      // 取源/解码期间用户可能已经点了暂停，此时不要再把音量淡回来，
+      // 否则会出现「点了暂停，200ms 后声音又响了一下」
+      if (!this._desiredPlaying) return;
+      howl.fade(0, this.volume, PLAY_PAUSE_FADE_DURATION);
 
       // 播放时确保开启player.
       // 避免因"忘记设置"导致在播放时播放器不显示的Bug
@@ -866,6 +1091,9 @@ export default class {
       ipcRenderer?.send('seeked', time);
     }
     if (time !== null) {
+      this._lastSeekAt = Date.now();
+      // 立即回写进度，让进度条跟手；同时告诉采样定时器这段时间不要覆盖
+      this._progress = time;
       this._howler?.seek(time);
       if (this._playing)
         this._playDiscordPresence(this._currentTrack, this.seek(null, false));
@@ -931,7 +1159,10 @@ export default class {
   }
   playTrackOnListByID(id, listName = 'default') {
     if (listName === 'default') {
-      this._current = this._list.findIndex(t => t === id);
+      // 随机模式下 this.list 是打乱后的列表，索引必须写到 _shuffledCurrent，
+      // 原实现直接写 _current，会导致「上一首 / 下一首」跳到错误的歌。
+      const index = this.list.findIndex(t => t === id);
+      this.current = index < 0 ? 0 : index;
     }
     this._replaceCurrentTrack(id);
   }

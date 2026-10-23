@@ -127,13 +127,15 @@
       </p>
     </Modal>
     <ContextMenu ref="albumMenu">
-      <!-- <div class="item">{{ $t('contextMenu.addToQueue') }}</div> -->
+      <!-- 原来这里有两项是死入口：「添加到队列」被注释掉，
+           「添加到歌单」没有绑定 click，点了只关菜单。
+           专辑级的「添加到歌单」语义本身也不成立（歌单装的是单曲），
+           因此直接移除，而不是补一个行为含糊的实现。 -->
       <div class="item" @click="likeAlbum(true)">{{
         dynamicDetail.isSub
           ? $t('contextMenu.removeFromLibrary')
           : $t('contextMenu.saveToLibrary')
       }}</div>
-      <div class="item">{{ $t('contextMenu.addToPlaylist') }}</div>
       <div class="item" @click="copyUrl(album.id)">{{
         $t('contextMenu.copyUrl')
       }}</div>
@@ -278,27 +280,48 @@ export default {
       setTimeout(() => {
         if (!this.show) NProgress.start();
       }, 1000);
-      getAlbum(id).then(data => {
-        this.album = data.album;
-        this.tracks = data.songs;
-        this.formatTitle();
-        NProgress.done();
-        this.show = true;
-
-        // to get explicit mark
-        let trackIDs = this.tracks.map(t => t.id);
-        getTrackDetail(trackIDs.join(',')).then(data => {
+      getAlbum(id)
+        .then(data => {
+          this.album = data.album;
           this.tracks = data.songs;
+          this.formatTitle();
+
+          // to get explicit mark
+          let trackIDs = this.tracks.map(t => t.id);
+          getTrackDetail(trackIDs.join(','))
+            .then(data => {
+              this.tracks = data.songs;
+            })
+            .catch(error => {
+              console.warn('[album] failed to load track detail', error);
+            });
+
+          // get more album by this artist
+          getArtistAlbum({ id: this.album.artist.id, limit: 100 })
+            .then(data => {
+              this.moreAlbums = data.hotAlbums;
+            })
+            .catch(error => {
+              console.warn('[album] failed to load artist albums', error);
+            });
+        })
+        .catch(error => {
+          // 原实现没有 catch：失败即永久白屏 + 进度条一直转
+          console.warn('[album] failed to load album', error);
+          this.showToast('专辑加载失败，请稍后重试');
+        })
+        .finally(() => {
+          NProgress.done();
+          this.show = true;
         });
 
-        // get more album by this artist
-        getArtistAlbum({ id: this.album.artist.id, limit: 100 }).then(data => {
-          this.moreAlbums = data.hotAlbums;
+      albumDynamicDetail(id)
+        .then(data => {
+          this.dynamicDetail = data;
+        })
+        .catch(error => {
+          console.warn('[album] failed to load dynamic detail', error);
         });
-      });
-      albumDynamicDetail(id).then(data => {
-        this.dynamicDetail = data;
-      });
     },
     toggleFullDescription() {
       this.showFullDescription = !this.showFullDescription;

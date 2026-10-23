@@ -277,25 +277,48 @@ export default {
       }, 1000);
       this.show = false;
       this.$parent.$refs.main.scrollTo({ top: 0 });
-      getArtist(id).then(data => {
-        this.artist = data.artist;
-        this.setPopularTracks(data.hotSongs);
-        if (next !== undefined) next();
-        NProgress.done();
-        this.show = true;
-      });
-      getArtistAlbum({ id: id, limit: 200 }).then(data => {
-        this.albumsData = data.hotAlbums;
-        this.latestRelease = data.hotAlbums[0];
-      });
-      artistMv({ id }).then(data => {
-        this.mvs = data.mvs;
-        this.hasMoreMV = data.hasMore;
-      });
-      if (isAccountLoggedIn()) {
-        similarArtists(id).then(data => {
-          this.similarArtists = data.artists;
+      getArtist(id)
+        .then(data => {
+          this.artist = data.artist;
+          this.setPopularTracks(data.hotSongs);
+          if (next !== undefined) next();
+        })
+        .catch(error => {
+          // 原实现没有 catch：失败即永久白屏 + 进度条一直转
+          console.warn('[artist] failed to load artist', error);
+          this.showToast('歌手信息加载失败，请稍后重试');
+        })
+        .finally(() => {
+          NProgress.done();
+          this.show = true;
         });
+
+      getArtistAlbum({ id: id, limit: 200 })
+        .then(data => {
+          this.albumsData = data.hotAlbums;
+          this.latestRelease = data.hotAlbums[0];
+        })
+        .catch(error => {
+          console.warn('[artist] failed to load albums', error);
+        });
+
+      artistMv({ id })
+        .then(data => {
+          this.mvs = data.mvs;
+          this.hasMoreMV = data.hasMore;
+        })
+        .catch(error => {
+          console.warn('[artist] failed to load mvs', error);
+        });
+
+      if (isAccountLoggedIn()) {
+        similarArtists(id)
+          .then(data => {
+            this.similarArtists = data.artists;
+          })
+          .catch(error => {
+            console.warn('[artist] failed to load similar artists', error);
+          });
       }
     },
     setPopularTracks(hotSongs) {

@@ -38,6 +38,38 @@ const log = text => {
   console.log(`${clc.blueBright('[background.js]')} ${text}`);
 };
 
+const SAFE_EXTERNAL_PROTOCOLS = new Set(['https:', 'http:']);
+
+/**
+ * 唯一允许调用 shell.openExternal 的入口。
+ *
+ * 原实现把渲染进程传来的任意 URL 直接交给 shell.openExternal，
+ * 而 Windows 上的 ms-msdt: / search-ms: / file: / smb: 等协议处理器
+ * 可以被当作命令执行原语使用。这里只放行 http/https。
+ *
+ * @param {string} rawUrl
+ * @returns {boolean} 是否已放行
+ */
+function safeOpenExternal(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl));
+  } catch (e) {
+    log(`[safeOpenExternal] blocked malformed url`);
+    return false;
+  }
+
+  if (!SAFE_EXTERNAL_PROTOCOLS.has(parsed.protocol)) {
+    log(`[safeOpenExternal] blocked protocol: ${parsed.protocol}`);
+    return false;
+  }
+
+  shell
+    .openExternal(parsed.href)
+    .catch(err => log(`[safeOpenExternal] failed: ${err.message}`));
+  return true;
+}
+
 const closeOnLinux = (e, win, store) => {
   let closeOpt = store.get('settings.closeAppOption');
   if (closeOpt !== 'exit') {
@@ -153,9 +185,46 @@ class Background {
     log('creating express app');
 
     const expressApp = express();
+    expressApp.disable('x-powered-by');
+
+    // 27232 端口对本机所有进程开放，而 /api 是一条全功能反代
+    // （能删歌单、换绑手机号、发短信、删云盘文件）。
+    // 这里加一层来源校验：浏览器发起的跨源请求一定带 Origin，
+    // 带了就必须在白名单里，否则拒绝。
+    //
+    // 注意局限：这挡不住本机非浏览器进程（curl / 恶意软件），
+    // 彻底解决需要一次性令牌 + preload，属于后续专项。
+    const ALLOWED_ORIGINS = new Set([
+      'http://localhost:27232',
+      'http://127.0.0.1:27232',
+    ]);
+    const guard = (req, res, next) => {
+      const origin = req.get('Origin');
+      const referer = req.get('Referer');
+
+      if (origin && !ALLOWED_ORIGINS.has(origin)) {
+        log(`[express] blocked cross-origin request from ${origin}`);
+        return res.status(403).end();
+      }
+      if (
+        !origin &&
+        referer &&
+        ![...ALLOWED_ORIGINS].some(o => referer.startsWith(o))
+      ) {
+        log(`[express] blocked cross-origin referer ${referer}`);
+        return res.status(403).end();
+      }
+      next();
+    };
+
     expressApp.use('/', express.static(__dirname + '/'));
-    expressApp.use('/api', expressProxy('http://127.0.0.1:10754'));
-    expressApp.use('/player', (req, res) => {
+    expressApp.use('/api', guard, expressProxy('http://127.0.0.1:10754'));
+    expressApp.use('/player', guard, (req, res) => {
+      // macOS 关闭窗口后 this.window 会被置为 null，
+      // 此时本机任意进程请求 /player 都会让主进程抛 TypeError（未捕获异常）。
+      if (!this.window || this.window.isDestroyed()) {
+        return res.status(503).json({ error: 'window not available' });
+      }
       this.window.webContents
         .executeJavaScript('window.yesplaymusic.player')
         .then(result => {
@@ -165,6 +234,9 @@ class Background {
               : result._currentTrack,
             progress: result._progress,
           });
+        })
+        .catch(err => {
+          res.status(500).json({ error: err.message });
         });
     });
     this.expressApp = expressApp.listen(27232, '127.0.0.1');
@@ -189,10 +261,28 @@ class Background {
       title: 'YesPlayMusic',
       show: false,
       webPreferences: {
-        webSecurity: false,
+        // —— 保留项 ——
+        // 项目有 8 处直接使用 window.require('electron' / 'os')，
+        // 在迁移到 preload + contextBridge 之前关闭会直接白屏。
         nodeIntegration: true,
-        enableRemoteModule: true,
         contextIsolation: false,
+        // UI 由 http://localhost:27232 提供，需要跨源加载封面与音频。
+        // 彻底开启需要先把 UI 切到 app:// 协议（已注册但未使用）。
+        webSecurity: false,
+        // nodeIntegration: true 要求 sandbox 必须为 false，显式声明避免误改
+        sandbox: false,
+
+        // —— 已关闭 ——
+        // Electron 12+ 默认即 false，这里曾被主动打开：
+        // 等于把主进程模块注册表暴露给渲染进程，
+        // require('electron').remote.require('child_process') 可直接执行命令。
+        enableRemoteModule: false,
+
+        // —— 顺手收紧，零兼容风险 ——
+        nodeIntegrationInWorker: false,
+        nodeIntegrationInSubFrames: false,
+        allowRunningInsecureContent: false,
+        experimentalFeatures: false,
       },
       backgroundColor:
         ((appearance === undefined || appearance === 'auto') &&
@@ -266,6 +356,23 @@ class Background {
 
   checkForUpdates() {
     if (isDevelopment) return;
+
+    // 默认关闭自动更新。
+    //
+    // 原因：electron-updater 依赖打包时生成的 app-update.yml，而本项目原先的
+    // publish 配置指向上游作者仓库（qier222/YesPlayMusic）。这条链路一旦生效，
+    // 用户装的是本地这份 fork，却会被提示「发现新版本」并下载安装上游版本，
+    // 等于用一次更新把本地改动全部覆盖掉。
+    //
+    // 现在 vue.config.js 里已不再生成 publish 配置，没有 app-update.yml，
+    // updater 本来也会失败。这里再加一道显式开关，避免出现「静默报错」或
+    // 「以后误配一个源就开始覆盖代码」的情况。
+    // 需要启用时：配置自己的 publish + 设置 YPM_ENABLE_AUTO_UPDATE=1。
+    if (process.env.YPM_ENABLE_AUTO_UPDATE !== '1') {
+      log('auto update disabled: no publish source configured');
+      return;
+    }
+
     log('checkForUpdates');
     autoUpdater.checkForUpdatesAndNotify();
 
@@ -274,16 +381,15 @@ class Background {
         .showMessageBox({
           title: '发现新版本 v' + info.version,
           message: '发现新版本 v' + info.version,
-          detail: '是否前往 GitHub 下载新版本安装包？',
+          detail: '是否前往发布页下载新版本安装包？',
           buttons: ['下载', '取消'],
           type: 'question',
           noLink: true,
         })
         .then(result => {
           if (result.response === 0) {
-            shell.openExternal(
-              'https://github.com/qier222/YesPlayMusic/releases'
-            );
+            // 走统一的协议白名单，避免 shell.openExternal 被当作命令执行原语
+            safeOpenExternal(info.downloadUrl || 'https://github.com');
           }
         });
     };
@@ -325,13 +431,20 @@ class Background {
       }
     });
 
-    this.window.on('resized', () => {
-      this.store.set('window', this.window.getBounds());
-    });
-
-    this.window.on('moved', () => {
-      this.store.set('window', this.window.getBounds());
-    });
+    // Electron 的窗口事件名是 resize / move，原实现写成了 resized / moved，
+    // 这两个监听从来没有触发过，窗口尺寸与位置实际上只在关闭时保存一次。
+    // 顺便加 300ms 防抖，拖拽窗口时不要每一帧都写磁盘。
+    let boundsTimer = null;
+    const saveWindowBounds = () => {
+      if (boundsTimer) clearTimeout(boundsTimer);
+      boundsTimer = setTimeout(() => {
+        boundsTimer = null;
+        if (!this.window || this.window.isDestroyed()) return;
+        this.store.set('window', this.window.getBounds());
+      }, 300);
+    };
+    this.window.on('resize', saveWindowBounds);
+    this.window.on('move', saveWindowBounds);
 
     this.window.on('maximize', () => {
       this.window.webContents.send('isMaximized', true);
@@ -341,28 +454,47 @@ class Background {
       this.window.webContents.send('isMaximized', false);
     });
 
-    this.window.webContents.on('new-window', function (e, url) {
-      e.preventDefault();
-      log('open url');
-      const excludeHosts = ['www.last.fm'];
-      const exclude = excludeHosts.find(host => url.includes(host));
-      if (exclude) {
-        const newWindow = new BrowserWindow({
-          width: 800,
-          height: 600,
-          titleBarStyle: 'default',
-          title: 'YesPlayMusic',
-          webPreferences: {
-            webSecurity: false,
-            nodeIntegration: true,
-            enableRemoteModule: true,
-            contextIsolation: false,
-          },
-        });
-        newWindow.loadURL(url);
-        return;
+    // 用 setWindowOpenHandler 替换已废弃的 new-window 事件。
+    // 关键修复：原实现用 url.includes('www.last.fm') 做子串判断，
+    // https://evil.tld/?ref=www.last.fm 同样会命中，并被塞进一个
+    // nodeIntegration:true 的窗口 —— 等于把 Node 权限交给任意远程页面。
+    this.window.webContents.setWindowOpenHandler(({ url }) => {
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch (e) {
+        return { action: 'deny' };
       }
-      shell.openExternal(url);
+
+      if (parsed.protocol !== 'https:') {
+        safeOpenExternal(url);
+        return { action: 'deny' };
+      }
+
+      const LASTFM_HOSTS = new Set(['www.last.fm', 'last.fm']);
+      if (LASTFM_HOSTS.has(parsed.hostname)) {
+        return {
+          action: 'allow',
+          overrideBrowserWindowOptions: {
+            width: 800,
+            height: 600,
+            titleBarStyle: 'default',
+            title: 'YesPlayMusic',
+            parent: this.window,
+            webPreferences: {
+              // 子窗口承载的是远程页面，必须与主窗口完全隔离
+              webSecurity: true,
+              nodeIntegration: false,
+              contextIsolation: true,
+              sandbox: true,
+              enableRemoteModule: false,
+            },
+          },
+        };
+      }
+
+      safeOpenExternal(url);
+      return { action: 'deny' };
     });
   }
 
@@ -477,7 +609,7 @@ class Background {
     });
 
     if (!isMac) {
-      app.on('second-instance', (e, cl, wd) => {
+      app.on('second-instance', () => {
         if (this.window) {
           this.window.show();
           if (this.window.isMinimized()) {

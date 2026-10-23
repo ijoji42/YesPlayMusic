@@ -154,34 +154,53 @@ export default {
       return this.getTopPlayList();
     },
     getRecommendPlayList() {
-      getRecommendPlayList(100, true).then(list => {
-        this.playlists = [];
-        this.updatePlaylist(list);
-      });
+      getRecommendPlayList(100, true)
+        .then(list => {
+          this.playlists = [];
+          this.updatePlaylist(list);
+        })
+        .catch(error => {
+          console.warn('[explore] failed to load recommend playlists', error);
+        });
     },
     getHighQualityPlaylist() {
       let playlists = this.playlists;
       let before =
         playlists.length !== 0 ? playlists[playlists.length - 1].updateTime : 0;
-      highQualityPlaylist({ limit: 50, before }).then(data => {
-        this.updatePlaylist(data.playlists);
-        this.hasMore = data.more;
-      });
+      highQualityPlaylist({ limit: 50, before })
+        .then(data => {
+          this.updatePlaylist(data.playlists);
+          this.hasMore = data.more;
+        })
+        .catch(error => {
+          console.warn(
+            '[explore] failed to load high quality playlists',
+            error
+          );
+        });
     },
     getTopLists() {
-      toplists().then(data => {
-        this.playlists = [];
-        this.updatePlaylist(data.list);
-      });
+      toplists()
+        .then(data => {
+          this.playlists = [];
+          this.updatePlaylist(data.list);
+        })
+        .catch(error => {
+          console.warn('[explore] failed to load toplists', error);
+        });
     },
     getTopPlayList() {
       topPlaylist({
         cat: this.activeCategory,
         offset: this.playlists.length,
-      }).then(data => {
-        this.updatePlaylist(data.playlists);
-        this.hasMore = data.more;
-      });
+      })
+        .then(data => {
+          this.updatePlaylist(data.playlists);
+          this.hasMore = data.more;
+        })
+        .catch(error => {
+          console.warn('[explore] failed to load top playlists', error);
+        });
     },
     getCatsByBigCat(name) {
       return playlistCategories.filter(c => c.bigCat === name);

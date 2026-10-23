@@ -1,5 +1,6 @@
 import clc from 'cli-color';
-import checkAuthToken from '../utils/checkAuthToken';
+// 纯副作用模块：确保 tmp 目录下存在 anonymous_token 文件，必须保留
+import '../utils/checkAuthToken';
 import server from '@neteaseapireborn/api/server';
 
 export async function startNeteaseMusicApi() {

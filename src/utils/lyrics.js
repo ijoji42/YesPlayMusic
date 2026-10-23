@@ -3,8 +3,9 @@ export function lyricParser(lrc) {
     lyric: parseLyric(lrc?.lrc?.lyric || ''),
     tlyric: parseLyric(lrc?.tlyric?.lyric || ''),
     romalyric: parseLyric(lrc?.romalrc?.lyric || ''),
-    lyricuser: lrc.lyricUser,
-    transuser: lrc.transUser,
+    // 这两个字段没有走可选链，接口返回空对象时会在渲染期抛 TypeError
+    lyricuser: lrc?.lyricUser,
+    transuser: lrc?.transUser,
   };
 }
 

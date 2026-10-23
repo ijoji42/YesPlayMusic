@@ -30,7 +30,13 @@
           <router-link :to="getTitleLink(item)">{{ item.name }}</router-link>
         </div>
         <div v-if="type !== 'artist' && subText !== 'none'" class="info">
-          <span v-html="getSubText(item)"></span>
+          <!-- 不再用 v-html 拼接远程数据（歌名 / 歌手名 / 简介都来自接口），
+               避免存储型 XSS；在 nodeIntegration 开启的 Electron 里，XSS 等价于任意代码执行。
+               需要跳转的歌手链接改用 router-link，顺带修掉了 hash 路由下 <a href> 会整页跳转的问题。 -->
+          <router-link v-if="getArtistLink(item)" :to="getArtistLink(item)">{{
+            getSubText(item)
+          }}</router-link>
+          <span v-else>{{ getSubText(item) }}</span>
         </div>
       </div>
     </div>
@@ -70,14 +76,15 @@ export default {
       if (this.subText === 'copywriter') return item.copywriter;
       if (this.subText === 'description') return item.description;
       if (this.subText === 'updateFrequency') return item.updateFrequency;
-      if (this.subText === 'creator') return 'by ' + item.creator.nickname;
-      if (this.subText === 'releaseYear')
-        return new Date(item.publishTime).getFullYear();
+      if (this.subText === 'creator')
+        return 'by ' + (item.creator?.nickname ?? '');
+      if (this.subText === 'releaseYear') return this.getYear(item.publishTime);
       if (this.subText === 'artist') {
-        if (item.artist !== undefined)
-          return `<a href="/artist/${item.artist.id}">${item.artist.name}</a>`;
-        if (item.artists !== undefined)
-          return `<a href="/artist/${item.artists[0].id}">${item.artists[0].name}</a>`;
+        if (item.artist !== undefined) return item.artist.name;
+        if (item.artists !== undefined && item.artists.length > 0) {
+          return item.artists[0].name;
+        }
+        return '';
       }
       if (this.subText === 'albumType+releaseYear') {
         let albumType = item.type;
@@ -88,9 +95,29 @@ export default {
         } else if (item.type === '专辑') {
           albumType = 'Album';
         }
-        return `${albumType} · ${new Date(item.publishTime).getFullYear()}`;
+        const year = this.getYear(item.publishTime);
+        return year ? `${albumType} · ${year}` : albumType;
       }
       if (this.subText === 'appleMusic') return 'by Apple Music';
+      return '';
+    },
+    getYear(publishTime) {
+      const year = new Date(publishTime).getFullYear();
+      return Number.isNaN(year) ? '' : year;
+    },
+    /**
+     * 需要跳转歌手页时返回目标路由，否则返回空。
+     * 替代原来把 <a> 标签拼进 HTML 字符串再 v-html 的做法。
+     */
+    getArtistLink(item) {
+      if (this.subText !== 'artist') return '';
+      if (item.artist !== undefined && item.artist.id) {
+        return `/artist/${item.artist.id}`;
+      }
+      if (item.artists !== undefined && item.artists[0]?.id) {
+        return `/artist/${item.artists[0].id}`;
+      }
+      return '';
     },
     isPrivacy(item) {
       return this.type === 'playlist' && item.privacy === 10;

@@ -30,6 +30,7 @@ export default {
     return {
       top: 0,
       thumbHeight: 0,
+      clientHeight: 0,
       active: false,
       show: false,
       hideTimer: null,
@@ -52,18 +53,39 @@ export default {
     },
   },
 
-  created() {
-    this.$router.beforeEach((to, from, next) => {
+  watch: {
+    // 原先在 created 里用 $router.beforeEach 注册守卫，组件销毁时不会解绑，
+    // 每创建一次就叠加一个守卫。改用路由变化监听。
+    $route() {
       this.show = false;
-      next();
-    });
+    },
+  },
+
+  mounted() {
+    this.updateClientHeight();
+    window.addEventListener('resize', this.updateClientHeight);
+  },
+
+  beforeDestroy() {
+    window.removeEventListener('resize', this.updateClientHeight);
+    if (this.hideTimer !== null) clearTimeout(this.hideTimer);
   },
 
   methods: {
+    updateClientHeight() {
+      const el = this.main;
+      if (!el) return;
+      // 视口高度只在窗口尺寸变化时改变，缓存下来避免每次滚动都强制 reflow
+      this.clientHeight = el.clientHeight - 128;
+    },
     handleScroll() {
-      const clintHeight = this.main.clientHeight - 128;
-      const scrollHeight = this.main.scrollHeight - 128;
-      const scrollTop = this.main.scrollTop;
+      const el = this.main;
+      if (!el) return;
+      const clintHeight = this.clientHeight || el.clientHeight - 128;
+      const scrollHeight = el.scrollHeight - 128;
+      if (clintHeight <= 0 || scrollHeight <= 0) return;
+
+      const scrollTop = el.scrollTop;
       let top = ~~((scrollTop / scrollHeight) * clintHeight);
       let thumbHeight = ~~((clintHeight / scrollHeight) * clintHeight);
 

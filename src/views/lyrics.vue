@@ -126,23 +126,7 @@
               </div>
             </div>
             <div class="progress-bar">
-              <span>{{ formatTrackTime(player.progress) || '0:00' }}</span>
-              <div class="slider">
-                <vue-slider
-                  v-model="player.progress"
-                  :min="0"
-                  :max="player.currentTrackDuration"
-                  :interval="1"
-                  :drag-on-click="true"
-                  :duration="0"
-                  :dot-size="12"
-                  :height="2"
-                  :tooltip-formatter="formatTrackTime"
-                  :lazy="true"
-                  :silent="true"
-                ></vue-slider>
-              </div>
-              <span>{{ formatTrackTime(player.currentTrackDuration) }}</span>
+              <PlayerProgress compact />
             </div>
             <div class="media-controls">
               <button-icon
@@ -310,6 +294,7 @@ import { formatTrackTime } from '@/utils/common';
 import { getLyric, getCloudLyric } from '@/api/track';
 import { lyricParser, copyLyric, parseLyric } from '@/utils/lyrics';
 import ButtonIcon from '@/components/ButtonIcon.vue';
+import PlayerProgress from '@/components/PlayerProgress.vue';
 import * as Vibrant from 'node-vibrant/dist/vibrant.worker.min.js';
 import Color from 'color';
 import { isAccountLoggedIn } from '@/utils/auth';
@@ -326,6 +311,7 @@ export default {
     VueSlider,
     ButtonIcon,
     ContextMenu,
+    PlayerProgress,
   },
   data() {
     return {
@@ -567,6 +553,17 @@ export default {
     },
     getLyric() {
       if (!this.currentTrack.id) return;
+      // 请求前先清空。原实现只在成功分支里重置，请求失败时上一首的歌词会
+      // 一直留在屏幕上 —— 显示错误的歌词比显示空白恶劣得多。
+      this.lyric = [];
+      this.tlyric = [];
+      this.romalyric = [];
+      const clearLyric = () => {
+        this.lyric = [];
+        this.tlyric = [];
+        this.romalyric = [];
+        return false;
+      };
       if (
         this.currentTrack.pc !== null &&
         this.currentTrack.cd === null &&
@@ -576,57 +573,61 @@ export default {
         return getCloudLyric(
           this.currentTrack.id,
           this.$store.state.data.user?.userId
-        ).then(data => {
-          this.tlyric = [];
-          this.romalyric = [];
-          this.lyric = data?.lrc?.length > 0 ? parseLyric(data.lrc) : [];
-          this.lyricType = 'translation';
-          return true;
-        });
-      }
-      return getLyric(this.currentTrack.id).then(data => {
-        if (!data?.lrc?.lyric) {
-          this.lyric = [];
-          this.tlyric = [];
-          this.romalyric = [];
-          return false;
-        } else {
-          let { lyric, tlyric, romalyric } = lyricParser(data);
-          lyric = lyric.filter(
-            l => !/^作(词|曲)\s*(:|：)\s*无$/.exec(l.content)
-          );
-          let includeAM =
-            lyric.length <= 10 &&
-            lyric.map(l => l.content).includes('纯音乐，请欣赏');
-          if (includeAM) {
-            let reg = /^作(词|曲)\s*(:|：)\s*/;
-            let author = this.currentTrack?.ar[0]?.name;
-            lyric = lyric.filter(l => {
-              let regExpArr = l.content.match(reg);
-              return (
-                !regExpArr || l.content.replace(regExpArr[0], '') !== author
-              );
-            });
-          }
-          if (lyric.length === 1 && includeAM) {
-            this.lyric = [];
+        )
+          .then(data => {
             this.tlyric = [];
             this.romalyric = [];
-            return false;
-          } else {
-            this.lyric = lyric;
-            this.tlyric = tlyric;
-            this.romalyric = romalyric;
-            if (tlyric.length * romalyric.length > 0) {
-              this.lyricType = 'translation';
-            } else {
-              this.lyricType =
-                lyric.length > 0 ? 'translation' : 'romaPronunciation';
-            }
+            this.lyric = data?.lrc?.length > 0 ? parseLyric(data.lrc) : [];
+            this.lyricType = 'translation';
             return true;
+          })
+          .catch(error => {
+            console.warn('[lyrics] failed to load cloud lyric', error);
+            return clearLyric();
+          });
+      }
+      return getLyric(this.currentTrack.id)
+        .then(data => {
+          if (!data?.lrc?.lyric) {
+            return clearLyric();
+          } else {
+            let { lyric, tlyric, romalyric } = lyricParser(data);
+            lyric = lyric.filter(
+              l => !/^作(词|曲)\s*(:|：)\s*无$/.exec(l.content)
+            );
+            let includeAM =
+              lyric.length <= 10 &&
+              lyric.map(l => l.content).includes('纯音乐，请欣赏');
+            if (includeAM) {
+              let reg = /^作(词|曲)\s*(:|：)\s*/;
+              let author = this.currentTrack?.ar[0]?.name;
+              lyric = lyric.filter(l => {
+                let regExpArr = l.content.match(reg);
+                return (
+                  !regExpArr || l.content.replace(regExpArr[0], '') !== author
+                );
+              });
+            }
+            if (lyric.length === 1 && includeAM) {
+              return clearLyric();
+            } else {
+              this.lyric = lyric;
+              this.tlyric = tlyric;
+              this.romalyric = romalyric;
+              if (tlyric.length * romalyric.length > 0) {
+                this.lyricType = 'translation';
+              } else {
+                this.lyricType =
+                  lyric.length > 0 ? 'translation' : 'romaPronunciation';
+              }
+              return true;
+            }
           }
-        }
-      });
+        })
+        .catch(error => {
+          console.warn('[lyrics] failed to load lyric', error);
+          return clearLyric();
+        });
     },
     switchLyricType() {
       this.lyricType =
@@ -895,21 +896,10 @@ export default {
 
     .progress-bar {
       margin-top: 22px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-
-      .slider {
-        width: 100%;
-        flex-grow: grow;
-        padding: 0 10px;
-      }
-
-      span {
-        font-size: 15px;
-        opacity: 0.58;
-        min-width: 28px;
-      }
+      width: 100%;
+      // 进度条本体改用 PlayerProgress（本地 250ms 采样）。
+      // 原来直接 v-model 到 player.progress，导致这一页每秒重渲染一次，
+      // 连带 60 行歌词 DOM 一起重建。紧凑变体保持原有的留白与字号。
     }
 
     .media-controls {

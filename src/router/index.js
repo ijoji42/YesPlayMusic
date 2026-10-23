@@ -146,26 +146,24 @@ VueRouter.prototype.push = function push(location) {
 
 router.beforeEach((to, from, next) => {
   // 需要登录的逻辑
+  //
+  // 原实现是三个并列的 if / if / else，当路由同时只带 requireAccountLogin
+  // （例如 /daily/songs）时，第一个 if 已经调过 next()，第二个 if 走 else
+  // 又调一次 next()，触发 "next() called multiple times"，
+  // 未登录时的重定向会被后一次 next() 覆盖掉。
   if (to.meta.requireAccountLogin) {
-    if (isAccountLoggedIn()) {
-      next();
-    } else {
-      next({ path: '/login/account' });
-    }
+    if (isAccountLoggedIn()) return next();
+    return next({ path: '/login/account' });
   }
+
   if (to.meta.requireLogin) {
-    if (isLooseLoggedIn()) {
-      next();
-    } else {
-      if (process.env.IS_ELECTRON === true) {
-        next({ path: '/login/account' });
-      } else {
-        next({ path: '/login' });
-      }
-    }
-  } else {
-    next();
+    if (isLooseLoggedIn()) return next();
+    return next({
+      path: process.env.IS_ELECTRON === true ? '/login/account' : '/login',
+    });
   }
+
+  next();
 });
 
 export default router;

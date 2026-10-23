@@ -1,34 +1,40 @@
 @font-face {
+  font-display: swap;
   font-family: 'Barlow';
   font-weight: normal;
   src: url('~@/assets/fonts/Barlow-Regular.woff2') format('woff2'),
     url('~@/assets/fonts/Barlow-Regular.ttf') format('truetype');
 }
 @font-face {
+  font-display: swap;
   font-family: 'Barlow';
-  font-weight: medium;
+  font-weight: 500;
   src: url('~@/assets/fonts/Barlow-Medium.woff2') format('woff2'),
     url('~@/assets/fonts/Barlow-Medium.ttf') format('truetype');
 }
 @font-face {
+  font-display: swap;
   font-family: 'Barlow';
   font-weight: 600;
   src: url('~@/assets/fonts/Barlow-SemiBold.woff2') format('woff2'),
     url('~@/assets/fonts/Barlow-SemiBold.ttf') format('truetype');
 }
 @font-face {
+  font-display: swap;
   font-family: 'Barlow';
   font-weight: bold;
   src: url('~@/assets/fonts/Barlow-Bold.woff2') format('woff2'),
     url('~@/assets/fonts/Barlow-Bold.ttf') format('truetype');
 }
 @font-face {
+  font-display: swap;
   font-family: 'Barlow';
   font-weight: 800;
   src: url('~@/assets/fonts/Barlow-ExtraBold.woff2') format('woff2'),
     url('~@/assets/fonts/Barlow-ExtraBold.ttf') format('truetype');
 }
 @font-face {
+  font-display: swap;
   font-family: 'Barlow';
   font-weight: 900;
   src: url('~@/assets/fonts/Barlow-Black.woff2') format('woff2'),
@@ -89,11 +95,24 @@ button {
   cursor: pointer;
   user-select: none;
 }
+// 键盘可达性：原实现把所有 input / button 的焦点轮廓直接抹掉，
+// 键盘用户完全看不到焦点在哪。现在鼠标点击不出环、键盘导航出环。
 input,
 button {
   &:focus {
     outline: none;
   }
+}
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+// 主色背景或毛玻璃上 outline 会和背景糊在一起，用双环兜底
+button:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--color-body-bg), 0 0 0 4px var(--color-primary);
 }
 a {
   color: inherit;
@@ -134,4 +153,90 @@ a {
 
 .user-select-none {
   user-select: none;
+}
+
+/* ============================================================
+ * 设计 token（新增，供组件逐步迁移）
+ * 原项目里字号 24 种、圆角 18 种、透明度 14 种、缓动曲线 7 条，
+ * 同一语义在不同组件里各写一个值。这里先建立契约，
+ * 新代码只允许使用下面的 token，旧代码按模块逐步替换。
+ * ============================================================ */
+:root {
+  /* 文本三级。0.58 是实测的 AA 下限（浅色 5.33:1 / 深色 6.23:1），不允许再低；
+     0.28 / 0.38 / 0.48 只允许用于纯装饰图标，不能用于任何文本 */
+  --c-text-1: rgba(0, 0, 0, 0.92);
+  --c-text-2: rgba(0, 0, 0, 0.72);
+  --c-text-3: rgba(0, 0, 0, 0.58);
+  --c-text-disabled: rgba(0, 0, 0, 0.34);
+
+  /* 字号 7 档 */
+  --fs-display: 48px;
+  --fs-h1: 32px;
+  --fs-h2: 22px;
+  --fs-body-lg: 16px;
+  --fs-body: 14px;
+  --fs-caption: 12px;
+  --fs-micro: 11px;
+
+  --lh-tight: 1.2;
+  --lh-normal: 1.5;
+
+  /* 间距：4 基数，9 档 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+  --sp-8: 64px;
+  --sp-9: 96px;
+
+  /* 圆角 5 档 */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-full: 999px;
+
+  /* 阴影 2 档 */
+  --shadow-1: 0 2px 6px -2px rgba(0, 0, 0, 0.12);
+  --shadow-2: 0 12px 24px -8px rgba(0, 0, 0, 0.18);
+
+  /* 动效：进入用 ease-out、退出用 ease-in，退出比进入快一档 */
+  --dur-1: 120ms;
+  --dur-2: 200ms;
+  --dur-3: 320ms;
+  --dur-4: 500ms;
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+[data-theme='dark'] {
+  --c-text-1: rgba(255, 255, 255, 0.94);
+  --c-text-2: rgba(255, 255, 255, 0.76);
+  --c-text-3: rgba(255, 255, 255, 0.58);
+  --c-text-disabled: rgba(255, 255, 255, 0.34);
+  --shadow-1: 0 2px 6px -2px rgba(0, 0, 0, 0.5);
+  --shadow-2: 0 12px 24px -8px rgba(0, 0, 0, 0.6);
+}
+
+/* 主题切换不再硬闪。原实现的 transition 挂在 #app 上，但 #app 没有背景，
+   真正变色的 body 反而没有过渡。 */
+body {
+  transition: background-color var(--dur-2) var(--ease-standard);
+}
+
+/* 尊重系统的「减弱动态效果」。原项目 0 处支持，
+   而歌词页有 150s 无限旋转 + 50px 模糊，属于持续前庭刺激。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

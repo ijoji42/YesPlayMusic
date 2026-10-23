@@ -20,7 +20,14 @@
         <div class="title">
           <router-link :to="'/mv/' + getID(mv)">{{ getTitle(mv) }}</router-link>
         </div>
-        <div class="artist" v-html="getSubtitle(mv)"></div>
+        <div class="artist">
+          <!-- 不再用 v-html 拼接远程数据（artistName / creator[0].userName 都来自接口），
+               避免存储型 XSS；nodeIntegration 开启时 XSS 等价于任意代码执行。 -->
+          <router-link v-if="getArtistLink(mv)" :to="getArtistLink(mv)">{{
+            getSubtitle(mv)
+          }}</router-link>
+          <span v-else>{{ getSubtitle(mv) }}</span>
+        </div>
       </div>
     </div>
   </div>
@@ -65,18 +72,30 @@ export default {
     getSubtitle(mv) {
       if (this.subtitle === 'artist') {
         let artistName = 'null';
-        let artistID = 0;
         if (mv.artistName !== undefined) {
           artistName = mv.artistName;
-          artistID = mv.artistId;
-        } else if (mv.creator !== undefined) {
+        } else if (mv.creator !== undefined && mv.creator.length > 0) {
           artistName = mv.creator[0].userName;
-          artistID = mv.creator[0].userId;
         }
-        return `<a href="/artist/${artistID}">${artistName}</a>`;
+        return artistName;
       } else if (this.subtitle === 'publishTime') {
         return mv.publishTime;
       }
+      return '';
+    },
+    /**
+     * 需要跳转歌手页时返回目标路由。
+     * 替代原来把 <a> 拼进 HTML 再 v-html 的做法。
+     */
+    getArtistLink(mv) {
+      if (this.subtitle !== 'artist') return '';
+      let artistID = 0;
+      if (mv.artistName !== undefined) {
+        artistID = mv.artistId;
+      } else if (mv.creator !== undefined && mv.creator.length > 0) {
+        artistID = mv.creator[0].userId;
+      }
+      return artistID ? `/artist/${artistID}` : '';
     },
   },
 };

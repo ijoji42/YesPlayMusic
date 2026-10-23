@@ -1,27 +1,6 @@
 <template>
   <div class="player" @click="handleClick" @mousedown="handleMouseDown">
-    <div
-      class="progress-bar"
-      :class="{
-        nyancat: settings.nyancatStyle,
-        'nyancat-stop': settings.nyancatStyle && !player.playing,
-      }"
-      @click.stop
-    >
-      <vue-slider
-        v-model="player.progress"
-        :min="0"
-        :max="player.currentTrackDuration"
-        :interval="1"
-        :drag-on-click="true"
-        :duration="0"
-        :dot-size="12"
-        :height="2"
-        :tooltip-formatter="formatTrackTime"
-        :lazy="true"
-        :silent="true"
-      ></vue-slider>
-    </div>
+    <player-progress />
     <div class="controls">
       <div class="playing">
         <div class="container" @click.stop>
@@ -185,6 +164,7 @@ import { mapState, mapMutations, mapActions } from 'vuex';
 import '@/assets/css/slider.css';
 
 import ButtonIcon from '@/components/ButtonIcon.vue';
+import PlayerProgress from '@/components/PlayerProgress.vue';
 import VueSlider from 'vue-slider-component';
 import { goToListSource, hasListSource } from '@/utils/playList';
 import { formatTrackTime } from '@/utils/common';
@@ -193,6 +173,7 @@ export default {
   name: 'Player',
   components: {
     ButtonIcon,
+    PlayerProgress,
     VueSlider,
   },
   data() {
@@ -223,7 +204,8 @@ export default {
     },
   },
   mounted() {
-    this.setupMediaControls();
+    // mediaSession 的 handler 统一由 Player.js 注册。
+    // 这里再注册一遍会把 play 覆盖成 toggle，系统媒体键会出现「按播放却暂停」。
     window.addEventListener('keydown', this.handleKeydown);
   },
   beforeDestroy() {
@@ -291,23 +273,6 @@ export default {
       this.player.mute();
     },
 
-    setupMediaControls() {
-      if ('mediaSession' in navigator) {
-        navigator.mediaSession.setActionHandler('play', () => {
-          this.playOrPause();
-        });
-        navigator.mediaSession.setActionHandler('pause', () => {
-          this.playOrPause();
-        });
-        navigator.mediaSession.setActionHandler('previoustrack', () => {
-          this.playPrevTrack();
-        });
-        navigator.mediaSession.setActionHandler('nexttrack', () => {
-          this.playNextTrack();
-        });
-      }
-    },
-
     handleKeydown(event) {
       switch (event.code) {
         case 'MediaPlayPause':
@@ -336,7 +301,7 @@ export default {
   display: flex;
   flex-direction: column;
   justify-content: space-around;
-  height: 64px;
+  height: 72px;
   backdrop-filter: saturate(180%) blur(30px);
   // background-color: rgba(255, 255, 255, 0.86);
   background-color: var(--color-navbar-bg);
@@ -349,20 +314,36 @@ export default {
   }
 }
 
-.progress-bar {
-  margin-top: -6px;
-  margin-bottom: -6px;
-  width: 100%;
-}
-
 .controls {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  height: 100%;
+  // 原先是 repeat(3, 1fr) —— 左侧要放封面 + 歌名 + 歌手 + 收藏，右侧只有几个图标，
+  // 三等分是几何公平而非视觉公平。而且 grid 子项默认 min-width: auto，
+  // 长歌名会把 1fr 撑破，把中控区挤走。
+  grid-template-columns: minmax(0, 1.15fr) auto minmax(0, 1fr);
+  column-gap: 24px;
+  // 用 flex: 1 而不是 height: 100%：进度条上方多了时间标签后，
+  // 两个子项加起来会超过 64px 的容器高度。
+  flex: 1;
+  min-height: 0;
   padding: {
     right: 10vw;
     left: 10vw;
   }
+}
+
+.playing,
+.playing .container,
+.playing .track-info {
+  min-width: 0;
+}
+
+.playing .track-info {
+  flex: 1;
+  overflow: hidden;
+}
+
+.middle-control-buttons .container {
+  min-width: 240px;
 }
 
 @media (max-width: 1336px) {

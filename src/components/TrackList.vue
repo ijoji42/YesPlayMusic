@@ -227,7 +227,17 @@ export default {
       }
     },
     play() {
-      this.player.addTrackToPlayNext(this.rightClickedTrack.id, true);
+      const id = this.rightClickedTrack.id;
+      // 原实现一律走 addTrackToPlayNext(id, true)：先把歌塞进「下一首播放」队列
+      // 再立刻消费掉。副作用是队列指针停在原来的位置，与当前实际播放的曲目脱节，
+      // 之后点「下一首」会跳到错误的歌。
+      // 如果这首歌本来就在当前播放列表里，直接在列表内定位播放；
+      // 不在列表里（比如从搜索结果右键）才退回「插入队列并立即播放」。
+      if (this.player.list.includes(id)) {
+        this.player.playTrackOnListByID(id);
+      } else {
+        this.player.addTrackToPlayNext(id, true);
+      }
     },
     addToQueue() {
       this.player.addTrackToPlayNext(this.rightClickedTrack.id);

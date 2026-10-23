@@ -12,9 +12,12 @@ const themeColorPresets = {
       primaryGradient: '#335eea',
     },
     dark: {
-      primary: '#335eea',
+      // 原值与浅色相同（#335eea），在 #222 背景上实测对比度只有 2.98:1，
+      // 导航栏「当前页」高亮、播放器激活图标都属于不可读状态。
+      // 提亮后实测 5.1:1，达到 WCAG AA。
+      primary: '#6b8dff',
       primaryBg: '#bbcdff',
-      primaryBgForTransparent: 'rgba(255, 255, 255, 0.12)',
+      primaryBgForTransparent: 'rgba(107, 141, 255, 0.24)',
       primaryGradient: '#335eea',
     },
   },

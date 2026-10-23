@@ -5,6 +5,34 @@ const { app, Menu } = require('electron');
 
 const isMac = process.platform === 'darwin';
 
+/**
+ * 安全读取快捷键。
+ *
+ * 原实现是 `shortcuts.find(s => s.id === id).shortcut`，
+ * settings.shortcuts 缺失或结构异常时会在主进程抛 TypeError，
+ * 而 createMenu 位于 app.on('ready') 的 async 回调里，
+ * 异常会变成 unhandled rejection —— 窗口照常显示，但菜单、全局快捷键、
+ * Dock 菜单、Touch Bar、MPRIS 的初始化全部被跳过。
+ *
+ * @param {Array|undefined} shortcuts 来自 store 的快捷键配置
+ * @param {string} id
+ * @returns {string|undefined}
+ */
+function getShortcut(shortcuts, id) {
+  const fromStore = Array.isArray(shortcuts)
+    ? shortcuts.find(s => s && s.id === id)
+    : undefined;
+  const fallback = defaultShortcuts.find(s => s.id === id);
+  // 注意：主进程由 webpack 4 编译，其 parser 不支持 ?. 和 ??，
+  // 这里必须写成兼容语法，否则打包时主进程直接编译失败。
+  const fromStoreShortcut = fromStore ? fromStore.shortcut : undefined;
+  const fallbackShortcut = fallback ? fallback.shortcut : undefined;
+  if (fromStoreShortcut !== undefined && fromStoreShortcut !== null) {
+    return fromStoreShortcut;
+  }
+  return fallbackShortcut;
+}
+
 export function createMenu(win, store) {
   let shortcuts = store.get('settings.shortcuts');
   if (shortcuts === undefined) {
@@ -75,42 +103,42 @@ export function createMenu(win, store) {
       submenu: [
         {
           label: 'Play',
-          accelerator: shortcuts.find(s => s.id === 'play').shortcut,
+          accelerator: getShortcut(shortcuts, 'play'),
           click: () => {
             win.webContents.send('play');
           },
         },
         {
           label: 'Next',
-          accelerator: shortcuts.find(s => s.id === 'next').shortcut,
+          accelerator: getShortcut(shortcuts, 'next'),
           click: () => {
             win.webContents.send('next');
           },
         },
         {
           label: 'Previous',
-          accelerator: shortcuts.find(s => s.id === 'previous').shortcut,
+          accelerator: getShortcut(shortcuts, 'previous'),
           click: () => {
             win.webContents.send('previous');
           },
         },
         {
           label: 'Increase Volume',
-          accelerator: shortcuts.find(s => s.id === 'increaseVolume').shortcut,
+          accelerator: getShortcut(shortcuts, 'increaseVolume'),
           click: () => {
             win.webContents.send('increaseVolume');
           },
         },
         {
           label: 'Decrease Volume',
-          accelerator: shortcuts.find(s => s.id === 'decreaseVolume').shortcut,
+          accelerator: getShortcut(shortcuts, 'decreaseVolume'),
           click: () => {
             win.webContents.send('decreaseVolume');
           },
         },
         {
           label: 'Like',
-          accelerator: shortcuts.find(s => s.id === 'like').shortcut,
+          accelerator: getShortcut(shortcuts, 'like'),
           click: () => {
             win.webContents.send('like');
           },

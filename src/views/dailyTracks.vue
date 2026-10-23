@@ -59,11 +59,18 @@ export default {
   methods: {
     ...mapMutations(['updateDailyTracks']),
     loadDailyTracks() {
-      dailyRecommendTracks().then(result => {
-        this.updateDailyTracks(result.data.dailySongs);
-        NProgress.done();
-        this.show = true;
-      });
+      dailyRecommendTracks()
+        .then(result => {
+          this.updateDailyTracks(result.data.dailySongs);
+        })
+        .catch(error => {
+          // 原实现没有 catch：失败即永久白屏 + 进度条一直转
+          console.warn('[dailyTracks] failed to load daily tracks', error);
+        })
+        .finally(() => {
+          NProgress.done();
+          this.show = true;
+        });
     },
     playDailyTracks() {
       let trackIDs = this.dailyTracks.map(t => t.id);

@@ -45,7 +45,7 @@ export function getTrackDetail(ids) {
         ids,
       },
     }).then(data => {
-      data.songs.map(song => {
+      data.songs.forEach(song => {
         const privileges = data.privileges.find(t => t.id === song.id);
         cacheTrackDetail(song, privileges);
       });
@@ -53,18 +53,21 @@ export function getTrackDetail(ids) {
       return data;
     });
   };
-  fetchLatest();
 
   let idsInArray = [String(ids)];
   if (typeof ids === 'string') {
     idsInArray = ids.split(',');
   }
 
+  // 原实现在读缓存之前就无条件发一次网络请求，命中缓存后把结果丢掉。
+  // 结果是「每切一首歌都白打一次接口」，弱网下还会抢带宽拖慢真正的音源请求。
+  // 现在只有缓存缺失时才走网络；歌曲详情的可播放性由 getMP3 的实时返回决定。
   return getTrackDetailFromCache(idsInArray).then(result => {
     if (result) {
       result.songs = mapTrackPlayableStatus(result.songs, result.privileges);
+      return result;
     }
-    return result ?? fetchLatest();
+    return fetchLatest();
   });
 }
 

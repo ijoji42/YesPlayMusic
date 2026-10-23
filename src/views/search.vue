@@ -73,14 +73,19 @@
       />
     </div>
 
-    <div v-show="!haveResult" class="no-results">
-      <div
-        ><svg-icon icon-class="search" />
-        {{
-          keywords.length === 0 ? '输入关键字搜索' : $t('search.noResult')
-        }}</div
-      >
-    </div>
+    <!-- 原实现是一行 24px 灰字（opacity 0.38，实测对比度 2.68:1，不达 WCAG AA），
+         而且只说「没有结果」，不告诉用户能做什么。 -->
+    <EmptyState
+      v-show="!haveResult"
+      class="no-results"
+      icon="search"
+      :title="keywords.length === 0 ? '输入关键字搜索' : $t('search.noResult')"
+      :description="
+        keywords.length === 0
+          ? '可以搜索歌曲、歌手、专辑或歌单'
+          : '换个关键词试试，或者检查一下有没有打错字'
+      "
+    />
   </div>
 </template>
 
@@ -93,6 +98,7 @@ import NProgress from 'nprogress';
 import TrackList from '@/components/TrackList.vue';
 import MvRow from '@/components/MvRow.vue';
 import CoverRow from '@/components/CoverRow.vue';
+import EmptyState from '@/components/EmptyState.vue';
 
 export default {
   name: 'Search',
@@ -100,6 +106,7 @@ export default {
     TrackList,
     MvRow,
     CoverRow,
+    EmptyState,
   },
   data() {
     return {
@@ -142,7 +149,6 @@ export default {
       this.$store.state.player.appendTrackToPlayerList(track, true);
     },
     search(type = 'all') {
-      let showToast = this.showToast;
       const typeTable = {
         all: 1018,
         musicVideos: 1004,
@@ -160,7 +166,14 @@ export default {
           return { result: result.result, type };
         })
         .catch(err => {
-          showToast(err.response.data.msg || err.response.data.message);
+          // 原实现直接读 err.response.data，网络错误（无 response）时会二次抛错，
+          // 且 catch 返回 undefined，让 Promise.all 的结果里出现 undefined
+          const message =
+            err?.response?.data?.msg ||
+            err?.response?.data?.message ||
+            '搜索请求失败';
+          this.showToast(message);
+          return { result: undefined, type };
         });
     },
     getData() {
@@ -171,37 +184,46 @@ export default {
 
       const requestAll = requests => {
         const keywords = this.keywords;
-        Promise.all(requests).then(results => {
-          if (keywords != this.keywords) return;
-          results.map(result => {
-            const searchType = result.type;
-            if (result.result === undefined) return;
-            result = result.result;
-            switch (searchType) {
-              case 'all':
-                this.result = result;
-                break;
-              case 'musicVideos':
-                this.musicVideos = result.mvs ?? [];
-                break;
-              case 'artists':
-                this.artists = result.artists ?? [];
-                break;
-              case 'albums':
-                this.albums = result.albums ?? [];
-                break;
-              case 'tracks':
-                this.tracks = result.songs ?? [];
-                this.getTracksDetail();
-                break;
-              case 'playlists':
-                this.playlists = result.playlists ?? [];
-                break;
-            }
+        Promise.all(requests)
+          .then(results => {
+            if (keywords != this.keywords) return;
+            results.forEach(item => {
+              // search() 失败时会返回 { result: undefined, type }，
+              // 原实现没有判空，直接读 item.type / item.result 会抛 TypeError 白屏
+              if (!item || item.result === undefined) return;
+              const searchType = item.type;
+              const result = item.result;
+              switch (searchType) {
+                case 'all':
+                  this.result = result;
+                  break;
+                case 'musicVideos':
+                  this.musicVideos = result.mvs ?? [];
+                  break;
+                case 'artists':
+                  this.artists = result.artists ?? [];
+                  break;
+                case 'albums':
+                  this.albums = result.albums ?? [];
+                  break;
+                case 'tracks':
+                  this.tracks = result.songs ?? [];
+                  this.getTracksDetail();
+                  break;
+                case 'playlists':
+                  this.playlists = result.playlists ?? [];
+                  break;
+              }
+            });
+          })
+          .catch(error => {
+            console.warn('[search] request failed', error);
+          })
+          .finally(() => {
+            // 无论成功失败都必须复位：否则 NProgress 会一直转、页面永远空白
+            NProgress.done();
+            this.show = true;
           });
-          NProgress.done();
-          this.show = true;
-        });
       };
 
       const requests = [

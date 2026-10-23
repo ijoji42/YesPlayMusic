@@ -7,7 +7,7 @@
       :style="{ overflow: enableScrolling ? 'auto' : 'hidden' }"
       @scroll="handleScroll"
     >
-      <keep-alive>
+      <keep-alive :max="6">
         <router-view v-if="$route.meta.keepAlive"></router-view>
       </keep-alive>
       <router-view v-if="!$route.meta.keepAlive"></router-view>
@@ -81,6 +81,10 @@ export default {
     window.addEventListener('keydown', this.handleKeydown);
     this.fetchData();
   },
+  beforeDestroy() {
+    window.removeEventListener('keydown', this.handleKeydown);
+    if (this._scrollRaf) cancelAnimationFrame(this._scrollRaf);
+  },
   methods: {
     handleKeydown(e) {
       if (e.code === 'Space') {
@@ -103,7 +107,13 @@ export default {
       }
     },
     handleScroll() {
-      this.$refs.scrollbar.handleScroll();
+      // 滚动事件每帧可能触发多次，而 handleScroll 内部要读 scrollHeight
+      // 等布局信息（强制 reflow）。合并到一帧执行一次，避免滚动时掉帧。
+      if (this._scrollRaf) return;
+      this._scrollRaf = requestAnimationFrame(() => {
+        this._scrollRaf = null;
+        this.$refs.scrollbar?.handleScroll();
+      });
     },
   },
 };
@@ -122,14 +132,14 @@ main {
   right: 0;
   left: 0;
   overflow: auto;
-  padding: 64px 10vw 96px 10vw;
+  padding: 64px 10vw 104px 10vw;
   box-sizing: border-box;
   scrollbar-width: none; // firefox
 }
 
 @media (max-width: 1336px) {
   main {
-    padding: 64px 5vw 96px 5vw;
+    padding: 64px 5vw 104px 5vw;
   }
 }
 

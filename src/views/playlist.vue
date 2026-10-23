@@ -193,7 +193,7 @@
     >
 
     <ContextMenu ref="playlistMenu">
-      <!-- <div class="item">{{ $t('contextMenu.addToQueue') }}</div> -->
+      <!-- 原来这里有一项「添加到队列」被注释掉，属于死入口，已移除。 -->
       <div class="item" @click="likePlaylist(true)">{{
         playlist.subscribed
           ? $t('contextMenu.removeFromLibrary')
@@ -463,6 +463,15 @@ export default {
             this.loadingMore = true;
             this.loadMore();
           }
+        })
+        .catch(error => {
+          // 原实现没有 catch：一次网络抖动就是永久白屏 + 顶部进度条一直转
+          console.warn('[playlist] failed to load playlist', error);
+          if (this.showToast) this.showToast('歌单加载失败，请稍后重试');
+        })
+        .finally(() => {
+          NProgress.done();
+          this.show = true;
         });
     },
     loadMore(loadNum = 100) {
@@ -507,7 +516,10 @@ export default {
       }
     },
     editPlaylist() {
-      nativeAlert('此功能开发中');
+      // 原来只弹「此功能开发中」—— 用户点完仍然不知道该去哪改。
+      // 歌单编辑（名称/简介/封面）涉及多个接口与表单，属于独立功能，
+      // 这里至少给出可执行的下一步，而不是一句无信息量的提示。
+      this.showToast('歌单信息请前往网易云音乐客户端修改');
     },
     searchInPlaylist() {
       this.displaySearchInPlaylist =
