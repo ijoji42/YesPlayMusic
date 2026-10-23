@@ -6,9 +6,10 @@ import { getPlaylistDetail, intelligencePlaylist } from '@/api/playlist';
 import { getLyric, getMP3, getTrackDetail, scrobble } from '@/api/track';
 import store from '@/store';
 import { isAccountLoggedIn } from '@/utils/auth';
+import { rewireAnalyser } from '@/utils/audioAnalyser';
 import { cacheTrackSource, getTrackSource } from '@/utils/db';
 import { isCreateMpris, isCreateTray } from '@/utils/platform';
-import { Howl } from 'howler';
+import { Howl, Howler } from 'howler';
 import shuffle from 'lodash/shuffle';
 import { decode as base642Buffer } from '@/utils/base64';
 
@@ -83,34 +84,23 @@ const delay = ms =>
     }, ms);
   });
 
-// 用户是否指定了非默认输出设备。'default' 和空值都表示「系统默认」。
-function hasCustomOutputDevice() {
-  const device = store.state.settings?.outputDevice;
-  return Boolean(device) && device !== 'default';
-}
-
 /**
  * 律动背景需要音频真正流过 Web Audio 图，AnalyserNode 才能读到频谱。
  *
  * Howler 的 html5 模式把播放交给 <audio> 元素直接输出到硬件，信号不经过
- * Howler.masterGain，挂在 masterGain 上的 analyser 读到的永远是全 0，
- * 界面上就是「当前音源无法读取频谱，背景已降级为静态效果」。
+ * Howler.masterGain，挂在 masterGain 上的 analyser 读到的永远是全 0。
+ * 所以只要律动被选中，就必须用 Web Audio 模式，与输出设备无关。
  *
- * 但也**不能**无条件关掉 html5：Web Audio 模式会把整首歌解码成 PCM 常驻内存
+ * 也不能无条件关掉 html5：Web Audio 模式会把整首歌解码成 PCM 常驻内存
  * （一首 4 分钟的 FLAC 约 80~130MB）。律动是默认不启用的功能，只有它真的被
  * 选中时才值得付这份内存代价。
  *
- * 还有一层设备约束：Web Audio 模式下 `_sounds[0]._node` 是音频节点而不是
- * <audio>，没有 setSinkId，而 Electron 13 的 Chromium 91 里 AudioContext
- * 也还没有 setSinkId —— 一旦切到 Web Audio，用户选的输出设备就会静默失效。
- * 设备路由是硬功能、律动是装饰，所以有自定义输出设备时优先保住设备，
- * 让律动退回静态（设置面板里有对应提示和「切回系统默认」按钮）。
+ * 设备路由不再由这里决定：Web Audio 模式下 `_node` 是 BufferSource，没有
+ * setSinkId，改由输出桥（MediaStreamDestination + 隐藏 <audio>）负责，
+ * 见 _applyOutputRouting()。
  */
 function needsWebAudioAnalysis() {
-  return (
-    store.state.settings?.lyricsBackground === 'reactive' &&
-    !hasCustomOutputDevice()
-  );
+  return store.state.settings?.lyricsBackground === 'reactive';
 }
 
 function setTitle(track) {
@@ -156,6 +146,10 @@ export default class {
     });
     this._currentSource = null; // 当前音源字符串，升级到 Web Audio 模式时重建要用
     this._howlerWebAudio = false; // 当前实例是否走 Web Audio 模式（可被 analyser 读取）
+    this._outBridge = null; // Web Audio 模式下的输出桥（MediaStreamDestination + 隐藏 audio）
+    // 桥里持有 MediaStreamDestination 和 <audio> 元素，Vue 观察它既无意义、
+    // 又可能把 MediaStream 上的原生对象包成响应式代理
+    Object.defineProperty(this, '_outBridge', { enumerable: false });
     this._analyserRebuild = null; // 升级中的 Promise，用于挡住并发调用
     // 并发锁没有任何视图依赖它，没必要让 Vue 把它变成响应式对象
     Object.defineProperty(this, '_analyserRebuild', {
@@ -270,10 +264,9 @@ export default class {
       }
     );
 
-    // 换输出设备：模式可能双向变化，所以允许降级。
-    // 250ms 防抖有两个作用：一是把设备列表里的连点合并成一次重建，
-    // 二是避开 syncAudioMode 的单槽锁——升级要等解码（0.3~2s），
-    // 途中再来的请求会被锁直接吞掉，最终实例会停在错误的音频模式上。
+    // 换输出设备：音频模式不再随设备变化（律动开着就一直是 Web Audio），
+    // 所以这里只改输出路由，不重建实例——重建会白断一次音。
+    // 250ms 防抖用于把设备列表里的连点合并成一次 setSinkId。
     store.watch(
       state => state.settings?.outputDevice,
       () => {
@@ -282,7 +275,7 @@ export default class {
         }
         this._outputDeviceSyncTimer = setTimeout(() => {
           this._outputDeviceSyncTimer = null;
-          this.syncAudioMode(true);
+          this._applyOutputRouting(store.state.settings?.outputDevice);
         }, 250);
       }
     );
@@ -602,6 +595,12 @@ export default class {
       : useWebAudio;
     this._bindHowlEvents(howl);
 
+    // Web Audio 模式下声音不经过 <audio> 的 setSinkId，必须由输出桥送到
+    // 用户选的设备；html5 模式则由 setOutputDevice() 直接改 _node。
+    if (this._howlerWebAudio) {
+      this._applyOutputRouting(store.state.settings?.outputDevice);
+    }
+
     // 交叉淡化：旧实例淡出后单独卸载。
     // 不使用 Howler.unload()（全局卸载会连带销毁预加载实例），
     // 也不会在切歌瞬间硬切造成可听见的爆音。
@@ -653,12 +652,11 @@ export default class {
    * - 升级（html5 → Web Audio）由「切到律动」触发，任何时候都允许；
    * - 降级（Web Audio → html5）默认**不允许**：那会让正在播的歌重新解码一次、
    *   中途断音，而省下来的内存对已经开始的这次播放没有意义。
-   *   唯一的例外是用户换了输出设备——设备路由只有 html5 的 <audio> 支持
-   *   （见 needsWebAudioAnalysis），此时宁可断一下也必须重建，否则用户
-   *   会以为设备选择失效了。这种场景由调用方传 allowDowngrade = true。
+   *   只有调用方显式传 allowDowngrade = true 才会降级（目前没有常规调用方）。
    *
-   * 注意：选了非默认输出设备时 needsWebAudioAnalysis() 恒为 false，
-   * 所以此时本方法的目标模式就是 html5。
+   * 目标模式只由「律动是否开启」决定（见 needsWebAudioAnalysis），
+   * 与输出设备无关：设备路由在 Web Audio 模式下由输出桥负责
+   * （_applyOutputRouting），不会再因为选了设备而退回 html5。
    *
    * @param {boolean} allowDowngrade 是否允许从 Web Audio 退回 html5
    * @returns {Promise<boolean>} 是否已处于目标模式
@@ -702,6 +700,11 @@ export default class {
         finish(false);
         return;
       }
+
+      // 走到这里新模式已经生效（_playAudioSource 同步换掉了实例与
+      // _howlerWebAudio，并已按新模式处理过输出路由）。退回 html5 时再补一次
+      // 拆桥：隐藏 <audio> 不能一直占着用户选的设备。
+      if (!this._howlerWebAudio) this._teardownOutputBridge();
 
       const howl = this._howler;
       if (!howl) {
@@ -1724,7 +1727,150 @@ export default class {
     }
   }
   /**
+   * 拆掉 Web Audio 输出桥，并把 masterGain 接回系统默认输出。
+   *
+   * 注意 `masterGain.disconnect()` 会一次性断掉它的**所有**出边，
+   * 包括 analyser 那一路旁路，所以恢复直连之后必须 rewireAnalyser()，
+   * 否则律动会突然读不到频谱（而声音是正常的，极难排查）。
+   */
+  _teardownOutputBridge() {
+    const bridge = this._outBridge;
+    if (!bridge) return;
+    this._outBridge = null;
+
+    try {
+      bridge.el.pause();
+    } catch (e) {
+      /* 元素可能已被移除 */
+    }
+    try {
+      bridge.el.srcObject = null;
+    } catch (e) {
+      /* ignore */
+    }
+    if (bridge.el.parentNode) bridge.el.parentNode.removeChild(bridge.el);
+
+    const ctx = Howler.ctx;
+    if (ctx && Howler.masterGain) {
+      try {
+        Howler.masterGain.disconnect();
+      } catch (e) {
+        /* ignore */
+      }
+      try {
+        Howler.masterGain.connect(ctx.destination);
+      } catch (e) {
+        /* 上下文已关闭，无处可接 */
+      }
+    }
+    rewireAnalyser();
+  }
+  /**
+   * 把 Howler 的主输出路由到指定设备。
+   *
+   * Web Audio 模式下 Howler 的声音由 masterGain 送出，而 Chromium 91 的
+   * AudioContext 还没有 setSinkId，`_node` 也不是 <audio>，所以设备选择
+   * 无处落地。这里绕一条路：masterGain → MediaStreamDestination，
+   * 再把这条 MediaStream 喂给一个隐藏 <audio>，对该元素 setSinkId。
+   * 信号仍然流过 Web Audio 图（analyser 照常能读），同时到达用户选的设备。
+   *
+   * 幂等：可以重复调用（起播、切歌、改设置都会调）。deviceId 是 'default'
+   * 或空值时拆桥，回到 masterGain → ctx.destination 的直连。
+   *
+   * @param {string=} deviceId 目标输出设备的 sinkId
+   */
+  async _applyOutputRouting(deviceId) {
+    const ctx = Howler.ctx;
+    const masterGain = Howler.masterGain;
+    if (!ctx || !masterGain) return;
+
+    // html5 模式下声音直接从 <audio> 出去，masterGain 上没有信号：
+    // 设备要改在节点自己身上，不能建桥（建了也只会多一个静音的出口）
+    if (!this._howlerWebAudio) {
+      this._teardownOutputBridge();
+      this.setOutputDevice();
+      return;
+    }
+
+    const wantCustom = Boolean(deviceId) && deviceId !== 'default';
+    if (!wantCustom) {
+      // 内部已恢复 masterGain → ctx.destination 并 rewireAnalyser
+      this._teardownOutputBridge();
+      return;
+    }
+
+    // 桥的 MediaStreamDestination 属于创建它的那个 AudioContext。
+    // Howler 重建上下文后旧桥就再也接不上了，必须换一个。
+    if (this._outBridge && this._outBridge.ctx !== ctx) {
+      this._teardownOutputBridge();
+    }
+
+    if (!this._outBridge) {
+      try {
+        const dest = ctx.createMediaStreamDestination();
+        const el = document.createElement('audio');
+        el.autoplay = false;
+        el.muted = false;
+        el.volume = 1;
+        el.setAttribute('data-ypm-output-bridge', '1');
+        el.style.cssText =
+          'position:fixed;width:0;height:0;opacity:0;pointer-events:none;left:-9999px;';
+        el.srcObject = dest.stream;
+        document.body.appendChild(el);
+        this._outBridge = { ctx, dest, el, deviceId: null };
+      } catch (e) {
+        // 建不出桥就保持现状（masterGain 还在 destination 上），至少还有声音
+        console.warn('[Player] create output bridge failed', e);
+        return;
+      }
+    }
+    const bridge = this._outBridge;
+    // 改接：masterGain 只连 stream，不连 destination，避免双份声音
+    try {
+      masterGain.disconnect();
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      masterGain.connect(bridge.dest);
+    } catch (e) {
+      // 接不上桥就没有任何出口，退回系统默认设备保住声音
+      console.warn('[Player] output bridge connect failed, falling back', e);
+      this._teardownOutputBridge();
+      return;
+    }
+    // disconnect() 连带断掉了 analyser 旁路，必须重新挂上
+    rewireAnalyser();
+
+    // 先切设备再起播：反过来的话，从 play() 到 setSinkId() 之间那一小段
+    // 声音会从系统默认设备漏出来
+    if (bridge.deviceId !== deviceId) {
+      try {
+        await bridge.el.setSinkId(deviceId);
+        bridge.deviceId = deviceId;
+      } catch (e) {
+        console.warn(
+          '[Player] setSinkId on output bridge failed, falling back',
+          e
+        );
+        this._teardownOutputBridge();
+        return;
+      }
+    }
+    try {
+      await bridge.el.play();
+    } catch (e) {
+      // 桥上的 <audio> 起不来就等于没有出口（彻底静音），
+      // 宁可退回系统默认设备也不要让用户以为播放器坏了
+      console.warn('[Player] output bridge play() failed, falling back', e);
+      this._teardownOutputBridge();
+    }
+  }
+  /**
    * 把当前音频节点切到设置里选的输出设备。
+   *
+   * html5 模式直接改 `<audio>` 的 sinkId；Web Audio 模式交给输出桥
+   * （_applyOutputRouting），两条路径都在这里收口。
    *
    * 原实现直接 `_node.setSinkId(store.state.settings.outputDevice)`：
    * 1. setSinkId 返回 Promise，设备被拔掉时会 reject，没有 catch 就是每次
@@ -1736,6 +1882,17 @@ export default class {
    * 并且保证不抛。
    */
   setOutputDevice() {
+    if (this._howlerWebAudio) {
+      // Web Audio 模式下 `_node` 是 BufferSource，没有 setSinkId，
+      // 声音由输出桥负责路由
+      this._applyOutputRouting(store.state.settings?.outputDevice);
+      return;
+    }
+
+    // html5 模式声音直接从 <audio> 出去，不经过 masterGain：桥必须拆掉，
+    // 否则那个隐藏 <audio> 会一直占着用户选的设备（桥不存在时是空操作）
+    this._teardownOutputBridge();
+
     const node = this._howler?._sounds?.[0]?._node;
     // 非 Electron / 老版本 Chromium 没有 setSinkId，跳过
     if (!node || typeof node.setSinkId !== 'function') return;

@@ -19,7 +19,6 @@ import {
   setReactiveConfig,
   mapFrameToVars,
   supportsReactive,
-  isDegraded,
   DEFAULT_REACTIVE_CONFIG,
   normalizeReactiveConfig,
 } from '@/utils/audioAnalyser';
@@ -45,7 +44,6 @@ export default {
   data() {
     return {
       isLive: false, // true = 真实音频驱动
-      isDegraded: false,
       visible: false,
       syntheticPulse: 0,
     };
@@ -66,12 +64,10 @@ export default {
       );
     },
     badgeText() {
-      if (this.isDegraded) return this.$t('settings.lyricsReactive.degraded');
       if (this.isLive) return this.$t('settings.lyricsReactive.preview');
       return this.$t('settings.lyricsReactive.previewSynthetic');
     },
     badgeClass() {
-      if (this.isDegraded) return 'warn';
       return this.isLive ? 'live' : 'demo';
     },
     canUseRealAudio() {
@@ -158,16 +154,7 @@ export default {
       this.stopAll();
       if (!this.visible) return;
       this.isLive = true;
-      this.isDegraded = false;
       this.unsubscribe = subscribe(frame => {
-        // 连续读不到频谱 → 停止真实驱动，退回模拟演示并提示用户
-        if (isDegraded()) {
-          this.isDegraded = true;
-          this.isLive = false;
-          this.stopAll();
-          this.startSynthetic();
-          return;
-        }
         this.applyVars(mapFrameToVars(frame, this.activeConfig));
       });
     },
@@ -295,10 +282,6 @@ export default {
 
     &.demo .dot {
       background: #fbbf24;
-    }
-
-    &.warn .dot {
-      background: #f87171;
     }
   }
 }

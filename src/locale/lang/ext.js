@@ -53,14 +53,9 @@ export default {
         preview: 'Preview',
         previewHint: 'Play any song to preview with real audio.',
         previewSynthetic: 'Simulated preview — play a song for real audio.',
-        degraded:
-          'The spectrum of this audio source is unreadable, so the background fell back to static.',
         reducedMotion:
           'Your system asks for reduced motion. Reactive background is off until you turn it on explicitly.',
         reducedMotionAction: 'Turn it on anyway',
-        outputDeviceBlocked:
-          'A custom output device is selected. Reactive background needs the Web Audio mixer, which bypasses device selection, so it stays static. Switch back to the system default to enable it.',
-        useSystemOutputDevice: 'Use system default',
       },
       crossfadeDuration: {
         text: 'Crossfade when switching tracks',
@@ -154,13 +149,9 @@ export default {
         preview: '预览',
         previewHint: '播放任意歌曲即可用真实音频预览。',
         previewSynthetic: '当前为模拟演示，播放歌曲后切换为真实音频。',
-        degraded: '当前音源无法读取频谱，背景已降级为静态效果。',
         reducedMotion:
           '系统开启了「减弱动态效果」，律动默认关闭。需要请手动开启。',
         reducedMotionAction: '仍然开启律动',
-        outputDeviceBlocked:
-          '当前选择了非默认输出设备。律动需要走 Web Audio 混音，会绕过设备选择，所以暂时保持静态。切回「系统默认」即可启用律动。',
-        useSystemOutputDevice: '切回系统默认',
       },
       crossfadeDuration: {
         text: '切歌交叉淡入淡出',
@@ -253,13 +244,9 @@ export default {
         preview: '預覽',
         previewHint: '播放任意歌曲即可用真實音訊預覽。',
         previewSynthetic: '目前為模擬示範，播放歌曲後切換為真實音訊。',
-        degraded: '目前音源無法讀取頻譜，背景已降級為靜態效果。',
         reducedMotion:
           '系統開啟了「減弱動態效果」，律動預設關閉。需要請手動開啟。',
         reducedMotionAction: '仍然開啟律動',
-        outputDeviceBlocked:
-          '目前選擇了非預設輸出裝置。律動需要走 Web Audio 混音，會繞過裝置選擇，所以暫時保持靜態。切回「系統預設」即可啟用律動。',
-        useSystemOutputDevice: '切回系統預設',
       },
       crossfadeDuration: {
         text: '切歌交叉淡入淡出',
@@ -354,14 +341,9 @@ export default {
         preview: 'Preview',
         previewHint: 'Play any song to preview with real audio.',
         previewSynthetic: 'Simulated preview — play a song for real audio.',
-        degraded:
-          'The spectrum of this audio source is unreadable, so the background fell back to static.',
         reducedMotion:
           'Your system asks for reduced motion. Reactive background is off until you turn it on explicitly.',
         reducedMotionAction: 'Turn it on anyway',
-        outputDeviceBlocked:
-          'A custom output device is selected. Reactive background needs the Web Audio mixer, which bypasses device selection, so it stays static. Switch back to the system default to enable it.',
-        useSystemOutputDevice: 'Use system default',
       },
       crossfadeDuration: {
         text: 'Crossfade when switching tracks',

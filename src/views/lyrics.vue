@@ -33,6 +33,9 @@
         :style="{ background }"
       ></div>
 
+      <!-- 纯装饰的抖动噪点层，用来打散 8-bit 色深下的渐变台阶 -->
+      <div class="lyrics-grain" aria-hidden="true"></div>
+
       <div class="left-side">
         <div>
           <div v-if="settings.showLyricsTime" class="date">
@@ -349,7 +352,6 @@ export default {
       reactiveConfig: normalizeReactiveConfig(
         this.$store.state.settings.lyricsReactive || DEFAULT_REACTIVE_CONFIG
       ),
-      reactiveDegraded: false,
     };
   },
   computed: {
@@ -564,19 +566,8 @@ export default {
       this.$nextTick(() => {
         if (!this.shouldRunReactive) return;
         if (!this.$refs.lyricsBackground) return;
-        this.reactiveDegraded = false;
         setReactiveConfig(this.reactiveConfig);
         this.reactiveUnsubscribe = subscribe(frame => {
-          if (frame.degraded) {
-            // 频谱读不到（跨域音源 / 解码失败）：只写一次静态值然后停手，
-            // 但保持订阅，音频恢复后能自己接回来。
-            if (!this.reactiveDegraded) {
-              this.reactiveDegraded = true;
-              this.applyReactiveFrame(null);
-            }
-            return;
-          }
-          if (this.reactiveDegraded) this.reactiveDegraded = false;
           this.applyReactiveFrame(frame);
         });
       });
@@ -586,7 +577,6 @@ export default {
         this.reactiveUnsubscribe();
         this.reactiveUnsubscribe = null;
       }
-      this.reactiveDegraded = false;
       const stage = this.$refs.lyricsBackground;
       if (!stage) return;
       // 清掉自定义属性，让 CSS 里的 var() 回退值（静态模糊）接管
@@ -870,21 +860,28 @@ export default {
 }
 
 .lyrics-background {
-  --contrast-lyrics-background: 75%;
-  --brightness-lyrics-background: 150%;
+  // 收敛后的放大倍数。原来 75% / 150% 会把每一个 8-bit 色阶台阶拉宽到肉眼
+  // 可辨的程度，断层就是这么被「放大」出来的；92% / 132% 保留原来的明暗
+  // 观感，但相邻色阶的落差回到了噪声可以盖住的量级。
+  --contrast-lyrics-background: 92%;
+  --brightness-lyrics-background: 132%;
 }
 
 [data-theme='dark'] .lyrics-background {
-  --contrast-lyrics-background: 125%;
-  --brightness-lyrics-background: 50%;
+  --contrast-lyrics-background: 112%;
+  --brightness-lyrics-background: 62%;
 }
 
 .lyrics-background {
   filter: blur(50px) contrast(var(--contrast-lyrics-background))
     brightness(var(--brightness-lyrics-background));
+  // 向外扩 6%：blur 的采样边界落在视口之外，四周不会出现一圈被滤镜
+  // 稀释过的暗边；同时尺寸和 .gradient-background 保持一致，切模式不跳动。
   position: absolute;
-  height: 100vh;
-  width: 100vw;
+  top: -6vh;
+  left: -6vw;
+  height: 112vh;
+  width: 112vw;
 
   .top-right,
   .bottom-left {
@@ -919,8 +916,10 @@ export default {
 // 避免每帧触发布局重排。
 .lyrics-background.reactive-background {
   // 用纯数字而不是百分比，这样 calc() 里做乘法是安全的
-  --react-base-brightness: 1.5;
-  --react-base-contrast: 0.75;
+  // 和 .lyrics-background 的 92% / 132% 同源，两套值必须一起改，
+  // 否则律动模式仍然是断的。
+  --react-base-brightness: 1.32;
+  --react-base-contrast: 0.92;
 
   // 辉光层是 ::after，需要一个裁切边界，否则边缘的径向渐变会溢出到歌词文字上
   overflow: hidden;
@@ -938,8 +937,8 @@ export default {
 }
 
 [data-theme='dark'] .lyrics-background.reactive-background {
-  --react-base-brightness: 0.5;
-  --react-base-contrast: 1.25;
+  --react-base-brightness: 0.62;
+  --react-base-contrast: 1.12;
 }
 
 // 两层景深：近层（右上，压在歌词前面）跟着缩放 + 大幅漂移，
@@ -1014,8 +1013,34 @@ export default {
 
 .gradient-background {
   position: absolute;
-  height: 100vh;
-  width: 100vw;
+  top: -6vh;
+  left: -6vw;
+  height: 112vh;
+  width: 112vw;
+}
+
+// 8-bit 色深下，blur(50px) 抹平细节后的大面积平滑渐变必然出现色阶台阶。
+// 叠一层极淡的噪声把台阶打散（dither），这是 Spotify / Apple Music 处理
+// 同一问题的标准做法：噪声幅度只要 1~2 个色阶，肉眼看不到颗粒，
+// 但足以让相邻色带之间不再有硬边。
+// 层级：z-index 0 盖在 .lyrics-background / .gradient-background（同为 0，
+// 但 DOM 顺序在前）之上，在 .left-side（z-index 1）和 .right-side
+// （z-index 0，DOM 顺序在后）之下，所以任何文字都不会被噪声覆盖。
+.lyrics-grain {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.035;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.86' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 160px 160px;
+}
+
+// 深色主题下背景本身已经很暗，噪声要更淡，否则暗部会浮出一层灰
+[data-theme='dark'] .lyrics-grain {
+  opacity: 0.022;
 }
 
 .left-side {

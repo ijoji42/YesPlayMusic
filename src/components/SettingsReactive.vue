@@ -98,23 +98,6 @@
         {{ $t('settings.lyricsReactive.reducedMotionAction') }}
       </button>
     </p>
-
-    <!-- 律动要读频谱就必须走 Web Audio 图，而 Web Audio 会绕过 <audio> 的
-         setSinkId（Electron 13 的 Chromium 91 里 AudioContext 还没有 setSinkId），
-         用户指定的输出设备会失效。设备路由是硬功能、律动是装饰，所以这种
-         情况下优先保住设备，并在这里给一条可点的回退路径。 -->
-    <p v-if="outputDeviceBlocksReactive" class="notice">
-      <span class="notice-text">{{
-        $t('settings.lyricsReactive.outputDeviceBlocked')
-      }}</span>
-      <button
-        type="button"
-        class="notice-action"
-        @click="useSystemOutputDevice"
-      >
-        {{ $t('settings.lyricsReactive.useSystemOutputDevice') }}
-      </button>
-    </p>
   </div>
 </template>
 
@@ -163,11 +146,6 @@ export default {
     // 用户是否已经显式同意「即使系统减弱动效也要开启律动」
     overridden() {
       return Boolean(this.settings.lyricsReactiveOverride);
-    },
-    // 选了具体输出设备时，律动无法同时生效（见模板里的注释）
-    outputDeviceBlocksReactive() {
-      const device = this.settings.outputDevice;
-      return Boolean(device) && device !== 'default';
     },
   },
   created() {
@@ -243,12 +221,6 @@ export default {
           value: 'reactive',
         });
       }
-    },
-    // 切回系统默认设备，让律动重新可用。提交后必须手动通知播放器重设 sink，
-    // 否则要等下一次起播才生效。
-    useSystemOutputDevice() {
-      this.$store.commit('changeOutputDevice', 'default');
-      this.player.setOutputDevice();
     },
   },
 };

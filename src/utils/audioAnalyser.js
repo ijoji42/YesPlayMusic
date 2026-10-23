@@ -5,11 +5,14 @@
 // 1. **音源必须是 Web Audio 模式**。Howler 的 html5 模式把播放交给 <audio> 元素
 //    直接输出到硬件，信号根本不经过 Howler.masterGain；而 analyser 是挂在
 //    masterGain 上的旁路监听，所以在 html5 模式下 getByteFrequencyData() 永远是
-//    全 0，界面只会一直显示「无法读取频谱」。Player.syncAudioMode() 负责
-//    在律动被选中时把当前实例单向升级成 Web Audio 模式。
+//    全 0。Player.syncAudioMode() 负责在律动被选中时把当前实例单向升级成
+//    Web Audio 模式。
+//    Web Audio 模式下的输出设备由 Player 的输出桥负责（masterGain →
+//    MediaStreamDestination → 隐藏 <audio>.setSinkId），所以「选了非默认设备」
+//    不再是降级理由。改接路由会调用本文件的 rewireAnalyser() 重新挂上 analyser。
 // 2. analyser 只从 masterGain 取信号，**绝不**再接 destination，否则声音会放两遍。
-// 3. 频谱读不到时（跨域音源 / 解码失败 / 上下文被挂起）必须能被上层识别出来，
-//    降级成静态背景，而不是显示一个「假装在动」的背景。
+// 3. 读不到频谱时（跨域音源 / 解码失败 / 上下文被挂起）这一帧的能量就是 0，
+//    视觉层自然表现为静止，不需要额外的降级状态，也不需要「假装在动」的兜底。
 // 4. 整个模块不进 Vuex、不进组件 data。每帧只写 CSS 自定义属性，避免整页重渲染。
 
 import { Howler } from 'howler';
@@ -24,7 +27,6 @@ const TARGET_FPS = 30; // 人眼对背景模糊的变化不敏感，30fps 足够
 const FRAME_INTERVAL = 1000 / TARGET_FPS;
 const BEAT_WINDOW_SECONDS = 0.7;
 const BEAT_FRAMES = Math.max(4, Math.round(BEAT_WINDOW_SECONDS * TARGET_FPS)); // 21
-const SILENT_FRAME_LIMIT = 60; // 连续 2 秒全 0 才认定「读不到频谱」
 const MIN_BEAT_LEVEL = 70; // 绝对门限，防止安静段落里的噪声被当成鼓点
 const PULSE_DECAY = 0.86; // 每帧衰减，半衰期约 0.15s
 const BASE_BLUR = 50; // 与 lyrics.vue 里 .lyrics-background 的 blur(50px) 对齐
@@ -193,8 +195,6 @@ let analyser = null;
 let freqData = null;
 let config = normalizeReactiveConfig(DEFAULT_REACTIVE_CONFIG);
 let beatDetector = null;
-let silentFrames = 0;
-let degraded = false;
 let pulse = 0;
 // 非对称包络后的归一化能量（0~1）。放在模块级而不是每帧局部变量，
 // 否则「释放慢」就没有跨帧记忆可言了。
@@ -208,7 +208,6 @@ let lastFrame = {
   smooth: 0,
   beat: false,
   pulse: 0,
-  degraded: false,
 };
 const subscribers = new Set();
 let rafId = null;
@@ -237,13 +236,30 @@ export function ensureAnalyser() {
     analyser = node;
     freqData = new Uint8Array(node.frequencyBinCount);
     beatDetector = createBeatDetector(BEAT_FRAMES);
-    silentFrames = 0;
     return analyser;
   } catch (e) {
     // 某些环境下 createAnalyser 会抛（上下文已关闭等），降级即可。
     analyser = null;
     freqData = null;
     return null;
+  }
+}
+
+/**
+ * 把 analyser 重新挂回 Howler.masterGain。
+ *
+ * `masterGain.disconnect()` 会一次性断掉它的**所有**出边（destination 和
+ * analyser 这一路都在内），所以每次改接输出路由之后都必须调一次这里。
+ * 同一对节点重复 connect 在 Web Audio 规范里是幂等的，不会叠出第二条支路。
+ */
+export function rewireAnalyser() {
+  if (!analyser) return;
+  const masterGain = Howler.masterGain;
+  if (!masterGain) return;
+  try {
+    masterGain.connect(analyser);
+  } catch (e) {
+    /* 已断开或上下文已关闭，忽略 */
   }
 }
 
@@ -259,8 +275,6 @@ export function releaseAnalyser() {
   analyser = null;
   freqData = null;
   beatDetector = null;
-  silentFrames = 0;
-  degraded = false;
   pulse = 0;
   smoothLevel = 0;
 }
@@ -396,26 +410,12 @@ export function getLastFrame() {
   return lastFrame;
 }
 
-/** 频谱是否已经确认读不到（连续 2 秒全 0）。 */
-export function isDegraded() {
-  return degraded;
-}
-
 function sampleFrame() {
   if (!ensureAnalyser()) return null;
   const bands = readBands();
   if (!bands) return null;
 
   const level = pickLevel(bands, config.band);
-  const silent = bands.bass === 0 && bands.mid === 0 && bands.treble === 0;
-  if (silent) {
-    silentFrames++;
-    if (silentFrames > SILENT_FRAME_LIMIT) degraded = true;
-  } else {
-    silentFrames = 0;
-    degraded = false;
-  }
-
   const beat = beatDetector
     ? beatDetector.push(level, config.sensitivity)
     : false;
@@ -435,7 +435,6 @@ function sampleFrame() {
     smooth: smoothLevel,
     beat,
     pulse,
-    degraded,
   };
   return lastFrame;
 }
@@ -510,6 +509,5 @@ export function __resetForTests() {
     smooth: 0,
     beat: false,
     pulse: 0,
-    degraded: false,
   };
 }
