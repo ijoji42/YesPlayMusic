@@ -16,6 +16,7 @@
       <Player v-if="enablePlayer" v-show="showPlayer" ref="player" />
     </transition>
     <Toast />
+    <CommandPalette ref="commandPalette" />
     <ModalAddTrackToPlaylist v-if="isAccountLoggedIn" />
     <ModalNewPlaylist v-if="isAccountLoggedIn" />
     <transition v-if="enablePlayer" name="slide-up">
@@ -27,6 +28,9 @@
 <script>
 import ModalAddTrackToPlaylist from './components/ModalAddTrackToPlaylist.vue';
 import ModalNewPlaylist from './components/ModalNewPlaylist.vue';
+import CommandPalette, {
+  isEditableTarget,
+} from './components/CommandPalette.vue';
 import Scrollbar from './components/Scrollbar.vue';
 import Navbar from './components/Navbar.vue';
 import Player from './components/Player.vue';
@@ -42,6 +46,7 @@ export default {
     Navbar,
     Player,
     Toast,
+    CommandPalette,
     ModalAddTrackToPlaylist,
     ModalNewPlaylist,
     Lyrics,
@@ -87,8 +92,14 @@ export default {
   },
   methods: {
     handleKeydown(e) {
+      // 已经被别的处理器认领的按键（例如设置页正在录制快捷键）不再处理
+      if (e.defaultPrevented) return false;
+      // 焦点在输入框 / textarea / 下拉框 / contenteditable 里时，空格是输入行为
+      // （打字、展开 <select>），不能劫持成播放暂停。
+      // 原实现只挡了 INPUT，导致设置页的 select、textarea 和命令面板的输入框
+      // 里按空格会开始播放。
+      if (isEditableTarget(e.target)) return false;
       if (e.code === 'Space') {
-        if (e.target.tagName === 'INPUT') return false;
         if (this.$route.name === 'mv') return false;
         e.preventDefault();
         this.player.playOrPause();
