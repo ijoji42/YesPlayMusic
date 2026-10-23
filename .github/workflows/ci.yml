@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+# Superseded runs on the same ref are pointless; cancel them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Lint / Unit tests / Web build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          # This repository commits yarn.lock and has no package-lock.json.
+          cache: yarn
+
+      - name: Install dependencies
+        # --ignore-scripts: the `postinstall` hook runs
+        # `electron-builder install-app-deps`, which is only meaningful when
+        # building an Electron installer. This job never does (see the note at
+        # the bottom of the file), so skipping it avoids downloading a ~100 MB
+        # Electron binary and rebuilding native modules for nothing.
+        # The esbuild platform binary ships as an optionalDependency, so
+        # `npm run test:unit` still works with scripts disabled.
+        run: |
+          if [ -f yarn.lock ]; then
+            yarn install --frozen-lockfile --ignore-scripts
+          elif [ -f package-lock.json ]; then
+            npm ci --ignore-scripts
+          else
+            npm install --ignore-scripts
+          fi
+
+      - name: Create .env from the committed example
+        # vue-cli inlines VUE_APP_* at build time and the build fails without
+        # VUE_APP_ELECTRON_API_URL, so this has to happen before lint/build.
+        run: cp .env.example .env
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Build (web target only)
+        # webpack 4 + terser-webpack-plugin 1.4.5 hardcode
+        # crypto.createHash('md4'), which throws ERR_OSSL_EVP_UNSUPPORTED on
+        # Node 17+ because OpenSSL 3 moved MD4 into the legacy provider.
+        env:
+          NODE_OPTIONS: --openssl-legacy-provider
+        run: npm run build
+
+      - name: Upload build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-web
+          path: dist
+          if-no-files-found: ignore
+          retention-days: 7
+# Deliberately NOT in this workflow: `npm run electron:build*`.
+# The Electron installer needs platform-specific binaries (dmg / nsis / AppImage
+# / snapcraft / rpm) and takes tens of minutes per OS. That path already lives
+# in .github/workflows/build.yaml, which runs on tags and workflow_dispatch.
