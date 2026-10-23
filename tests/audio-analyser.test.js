@@ -264,6 +264,44 @@ describe('audioAnalyser', () => {
       assert.equal(fallback['--react-bass'], '1');
     });
 
+    // AGC 状态机单独可调用：状态作为参数传入，不需要 AudioContext，
+    // 也不必绕 sampleFrame() 间接测。
+    it('drives the AGC state machine directly', () => {
+      assert.equal(typeof analyser.__updateAgcForTests, 'function');
+      assert.equal(typeof analyser.createAgcState, 'function');
+
+      const state = analyser.createAgcState();
+      const first = analyser.__updateAgcForTests(state, 232);
+      // 首帧把当前值当谷底、并给一个 floor 跨度的峰顶 → 归一化结果是 0
+      assert.equal(first.amp, 0);
+      assert.equal(first.span, 24);
+      assert.equal(state.min, 232);
+      assert.equal(state.max, 256);
+
+      // 状态是就地更新的：往上一跳立刻能读到一个明显大于 0 的 amp
+      const up = analyser.__updateAgcForTests(state, 246);
+      assert.ok(up.amp > 0.5, `expected a jump, got ${up.amp}`);
+      assert.equal(up.span, 24);
+
+      // 静音帧不推进基准
+      const before = { min: state.min, max: state.max };
+      const silent = analyser.__updateAgcForTests(state, 0);
+      assert.equal(silent.amp, 0);
+      assert.equal(state.min, before.min);
+      assert.equal(state.max, before.max);
+    });
+
+    // 运行时要靠 lastFrame 判断「AGC 收敛到哪了」，字段名不能悄悄变。
+    it('reports amp and the converged AGC state on lastFrame', () => {
+      const frame = analyser.getLastFrame();
+      assert.equal(typeof frame.amp, 'number');
+      assert.equal(typeof frame.agc.min, 'number');
+      assert.equal(typeof frame.agc.max, 'number');
+      assert.equal(typeof frame.agc.span, 'number');
+      assert.equal(typeof frame.smooth, 'number');
+      assert.equal(typeof frame.bassAmp, 'number');
+    });
+
     it('migrates the legacy hue dimension to drift', () => {
       const on = analyser.normalizeReactiveConfig({
         dimensions: { scale: true, hue: true },

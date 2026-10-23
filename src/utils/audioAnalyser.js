@@ -238,6 +238,8 @@ let lastFrame = {
   treble: 0,
   energy: 0,
   level: 0,
+  amp: 0,
+  agc: { min: 0, max: 0, span: 0 },
   smooth: 0,
   beat: false,
   pulse: 0,
@@ -509,24 +511,51 @@ function updateAgc(agc, value) {
 }
 
 /**
- * 一条 AGC 通道。`push(绝对电平)` 返回 `{ amp, span }`：
+ * AGC 的单步推进，**状态作为参数传入**，不依赖任何模块级变量。
+ *
+ * `state` 是普通对象 `{ min, max, ready, span }`，会被就地更新；
+ * 返回 `{ amp, span, min, max }`：
  *   amp  —— 归一化后的 0~1（已做 gamma 提升）
  *   span —— 当前跨度，节拍检测用它来缩放阈值
  *
  * 低于 AGC_SILENCE 的帧直接返回 amp=0，且**不推进基准** —— 静音不该改变增益。
- * 单独导出是为了让测试能直接驱动这条状态机，不必造一个 AudioContext。
+ * 抽成纯函数是为了让测试能直接驱动这条状态机（见 __updateAgcForTests），
+ * 不必造一个 AudioContext，也不必绕 sampleFrame() 间接测。
+ */
+export function stepAgc(state, value) {
+  if (!Number.isFinite(value) || value < AGC_SILENCE) {
+    return { amp: 0, span: state.span, min: state.min, max: state.max };
+  }
+  const span = updateAgc(state, value);
+  state.span = span;
+  const raw = clamp((value - state.min) / span, 0, 1);
+  return {
+    amp: Math.pow(raw, AGC_GAMMA),
+    span,
+    min: state.min,
+    max: state.max,
+  };
+}
+
+/** 测试入口：把 AGC 状态机的单步推进暴露成可直接调用的函数。 */
+export function __updateAgcForTests(state, value) {
+  return stepAgc(state, value);
+}
+
+/** 新建一份 AGC 状态。字段和 stepAgc 就地更新的对象完全一致。 */
+export function createAgcState() {
+  return { min: 0, max: 0, ready: false, span: AGC_FLOOR_SPAN };
+}
+
+/**
+ * 一条 AGC 通道。`push(绝对电平)` 返回 `{ amp, span }`，
+ * `state()` 返回收敛后的 `{ min, max, span }`（会写进 lastFrame 供运行时排查）。
  */
 export function createAgcTracker() {
-  const agc = { min: 0, max: 0, ready: false, span: AGC_FLOOR_SPAN };
+  const agc = createAgcState();
   return {
     push(value) {
-      if (!Number.isFinite(value) || value < AGC_SILENCE) {
-        return { amp: 0, span: agc.span };
-      }
-      const span = updateAgc(agc, value);
-      agc.span = span;
-      const raw = clamp((value - agc.min) / span, 0, 1);
-      return { amp: Math.pow(raw, AGC_GAMMA), span };
+      return stepAgc(agc, value);
     },
     reset() {
       agc.min = 0;
@@ -579,6 +608,10 @@ function sampleFrame() {
     treble: bands.treble,
     energy: bands.energy,
     level,
+    // amp 是 AGC 之后的归一化能量（还没过非对称包络），smooth 是包络后的值。
+    // 两个都留，排查「为什么不动」时能一眼分清是 AGC 没拉开还是包络太黏。
+    amp: target,
+    agc: { min: levelAgc.min, max: levelAgc.max, span },
     smooth: smoothLevel,
     beat,
     pulse,
@@ -660,6 +693,8 @@ export function __resetForTests() {
     treble: 0,
     energy: 0,
     level: 0,
+    amp: 0,
+    agc: { min: 0, max: 0, span: 0 },
     smooth: 0,
     beat: false,
     pulse: 0,
