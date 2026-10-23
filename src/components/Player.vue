@@ -69,8 +69,15 @@
             :title="$t(player.playing ? 'player.pause' : 'player.play')"
             @click.native="playOrPause"
           >
-            <svg-icon :icon-class="player.playing ? 'pause' : 'play'"
-          /></button-icon>
+            <svg-icon :icon-class="player.playing ? 'pause' : 'play'" />
+            <!-- 切歌时下一首还没就绪：用一圈细环表示「正在取音源」，
+                 命中预载时这个环根本不会出现 -->
+            <span
+              v-if="player.loadingNext"
+              class="play-loading-ring"
+              aria-hidden="true"
+            ></span>
+          </button-icon>
           <button-icon :title="$t('player.next')" @click.native="playNextTrack"
             ><svg-icon icon-class="next"
           /></button-icon>
@@ -427,12 +434,58 @@ export default {
     margin: 0 8px;
   }
   .play {
+    // 加载环要绝对定位在这个按钮内部
+    position: relative;
     height: 42px;
     width: 42px;
     .svg-icon {
       width: 24px;
       height: 24px;
     }
+  }
+}
+
+// 切歌加载态：只有「没有命中预载」时才会出现。
+// 纯 CSS 动画，不额外引入任何依赖；prefers-reduced-motion 下退化成
+// 静态的半透明环 + 缓慢呼吸，不转圈。
+.play-loading-ring {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  bottom: 4px;
+  left: 4px;
+  border: 2px solid transparent;
+  border-top-color: var(--color-primary);
+  border-right-color: var(--color-primary);
+  border-radius: 50%;
+  opacity: 0.9;
+  pointer-events: none;
+  animation: play-loading-spin 0.9s linear infinite;
+}
+
+@keyframes play-loading-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes play-loading-breathe {
+  0%,
+  100% {
+    opacity: 0.28;
+  }
+  50% {
+    opacity: 0.72;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .play-loading-ring {
+    border-color: var(--color-primary);
+    animation: play-loading-breathe 1.6s ease-in-out infinite;
   }
 }
 

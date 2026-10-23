@@ -301,3 +301,19 @@ export function formatTrackTime(value) {
   let sec = (~~(value % 60)).toString().padStart(2, '0');
   return `${min}:${sec}`;
 }
+
+/**
+ * 判断事件目标是否是「用户正在输入」的元素。
+ *
+ * 用于全局快捷键的让位判断：焦点在输入框 / textarea / 下拉框 / contenteditable
+ * 里时，空格是打字、是展开下拉，不能劫持成播放暂停；Cmd/Ctrl+K 也不该抢。
+ *
+ * @param {EventTarget|null} target
+ * @returns {boolean}
+ */
+export function isEditableTarget(target) {
+  if (!target || typeof target.tagName !== 'string') return false;
+  const tag = target.tagName.toUpperCase();
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  return target.isContentEditable === true;
+}

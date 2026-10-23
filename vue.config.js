@@ -122,9 +122,10 @@ module.exports = {
         //   },
         // ],
         directories: {
-          // 旧的 dist_electron 被一个残留句柄占着（app.asar 无法删除），
-          // 本次输出到独立目录避免冲突；旧目录释放后可改回 'dist_electron'。
-          output: 'dist_electron_v0412',
+          // 旧的 dist_electron / dist_electron_v0412 曾被残留句柄占住
+          // （app.asar 无法删除），所以每个版本输出到独立目录，
+          // 避免「上一个包还在跑」时打包直接失败。
+          output: 'dist_electron_v050',
         },
         mac: {
           target: [

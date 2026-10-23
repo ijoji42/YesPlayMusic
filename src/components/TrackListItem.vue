@@ -103,6 +103,13 @@ export default {
       type: Boolean,
       default: true,
     },
+    // 父级（TrackList）一次性建好的 liked 歌曲 id 索引。
+    // 每行如果直接对 liked.songs 做 includes()，500 行 × N 条 id
+    // 会退化成几十万次比较，而且每次依赖变化都会全量重算。
+    likedSongIdSet: {
+      type: Set,
+      default: null,
+    },
   },
 
   data() {
@@ -168,6 +175,8 @@ export default {
       return this.type === 'playlist';
     },
     isLiked() {
+      if (this.likedSongIdSet) return this.likedSongIdSet.has(this.track?.id);
+      // 兜底：调用方没传索引时维持旧行为，避免漏传导致收藏态全灭。
       return this.$parent.liked.songs.includes(this.track?.id);
     },
     isPlaying() {

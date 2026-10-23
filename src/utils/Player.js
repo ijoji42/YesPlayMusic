@@ -19,6 +19,20 @@ const TRACK_CROSSFADE_DURATION = 160;
 const PERSIST_THROTTLE = 800;
 // 进度持久化间隔（独立的轻量 key，不参与 player 快照序列化）
 const PROGRESS_SAVE_INTERVAL = 2000;
+// 当前曲目起播后延迟这么久再开始预载下一首。
+// 立刻预载会和当前曲目自己的缓冲抢带宽，弱网下反而推迟「多久能听见声音」。
+const PRELOAD_DELAY = 1500;
+// 预载实例的保鲜期。音源 URL 会过期，太旧的预载宁可丢掉重新取一次。
+const PRELOAD_MAX_AGE = 5 * 60 * 1000;
+// 拖动进度条会连续触发 seek，松手之后再重新预载
+const SEEK_PRELOAD_DELAY = 1200;
+// 加载态兜底超时：任何异常路径都不应该让播放按钮一直转圈
+const LOADING_NEXT_TIMEOUT = 15000;
+// 提升预载实例后迟迟没有起播时的等待时间，超时则回退到常规取源流程
+const PRELOAD_PROMOTE_TIMEOUT = 3000;
+// 同时存活的 Blob URL 上限：当前 + 交叉淡化中 + 预载 + 一次切换的余量。
+// 上限过低会 revoke 掉正在播放的 URL（历史 bug），过高则白白占住内存。
+const MAX_BLOB_URLS = 4;
 
 const INDEX_IN_PLAY_NEXT = -1;
 
@@ -97,6 +111,11 @@ export default class {
     this._lastSeekAt = 0; // 最近一次用户 seek 的时间戳
     this._lastProgressSave = 0; // 最近一次进度落盘的时间戳
     this._desiredPlaying = false; // 用户期望的播放状态（用于淡入淡出竞态判定）
+    this._pauseSeq = 0; // 用户主动暂停的次数，用于取消「等待音源期间」的自动播放
+    this._pendingFadeIn = null; // 下一次起播后使用的淡入时长（交叉淡化用）
+    this._loadingNext = false; // 是否正在为下一首等待音源（驱动播放按钮的加载态）
+    this._loadingTimer = null; // 加载态的兜底计时器
+    this._playWatchdog = null; // 预载实例提升后的起播看门狗
 
     // 播放信息
     this._list = []; // 播放列表
@@ -133,6 +152,28 @@ export default class {
     // 上一个 howler 实例，切歌时用于交叉淡化后卸载
     this._fadingHowler = null;
 
+    /**
+     * 下一首的预载槽位（单槽）。
+     *
+     * 结构：{ trackID, track, source, howl, createdAt }
+     * 只有一份实例：任何一次「换下一首」都会先卸载旧的再建新的，
+     * 否则每次切歌都会多留一个 <audio> 节点 + 一个 Blob URL。
+     */
+    this._preload = null;
+    // 预载任务的序号守卫：连续切歌时，先发出的预载不能覆盖后发出的结果
+    this._preloadSeq = 0;
+    this._preloadTimer = null;
+
+    // 这两个字段都持有 Howl 实例。Vue 会对 store.state.player 的可枚举属性
+    // 做深度 observe，把整棵 Howl 对象树变成响应式对象既无意义、又会在每次
+    // 切歌时产生一次深遍历，所以和 _howler 一样声明为非枚举。
+    Object.defineProperty(this, '_fadingHowler', {
+      enumerable: false,
+    });
+    Object.defineProperty(this, '_preload', {
+      enumerable: false,
+    });
+
     // init
     this._init();
 
@@ -160,6 +201,8 @@ export default class {
       return;
     }
     this._repeatMode = mode;
+    // 循环模式变了，「下一首」就不再是同一首歌，预载作废并重建
+    this._refreshPreload();
   }
   get shuffle() {
     return this._shuffle;
@@ -176,6 +219,8 @@ export default class {
     }
     // 同步当前歌曲在列表中的下标
     this.current = this.list.indexOf(this.currentTrackID);
+    // 随机顺序变了，「下一首」整条链路都变了，预载作废并重建
+    this._refreshPreload();
   }
   get reversed() {
     return this._reversed;
@@ -188,6 +233,8 @@ export default class {
     }
     console.log('changing reversed to:', reversed);
     this._reversed = reversed;
+    // 倒序模式下「下一首」方向相反，预载作废并重建
+    this._refreshPreload();
   }
   get volume() {
     return this._volume;
@@ -217,6 +264,15 @@ export default class {
   }
   get playing() {
     return this._playing;
+  }
+  /**
+   * 是否正在为「下一首」等待音源。
+   *
+   * 命中预载时整条链路都是同步的，这个值根本不会变 true；
+   * 只有真的要走网络取歌单详情 / 音源时才会亮起来，用来驱动播放按钮上的加载环。
+   */
+  get loadingNext() {
+    return this._loadingNext;
   }
   get currentTrack() {
     return this._currentTrack;
@@ -255,6 +311,7 @@ export default class {
       if (isCreateMpris) {
         ipcRenderer?.send('seeked', this._howler.seek());
       }
+      this._onUserSeek();
     }
   }
   get isCurrentTrackLiked() {
@@ -263,6 +320,10 @@ export default class {
 
   _init() {
     this._loadSelfFromLocalStorage();
+    // 运行时字段不接受历史快照的影响：否则上一次会话残留的 true
+    // 会让播放按钮一启动就转圈。
+    this._loadingNext = false;
+    this._pendingFadeIn = null;
     this._howler?.volume(this.volume);
 
     if (this._enabled) {
@@ -411,45 +472,86 @@ export default class {
       });
     }
   }
-  _playAudioSource(source, autoplay = true) {
+  /**
+   * 把一个音源变成「当前正在播的 howler」。
+   *
+   * @param {string} source 音源 URL（预载命中时只作为日志/兜底信息）
+   * @param {boolean} autoplay 是否立即起播
+   * @param {import('howler').Howl=} preloadedHowl 命中预载槽位时直接提升的实例
+   */
+  _playAudioSource(source, autoplay = true, preloadedHowl = null) {
     const previous = this._howler;
+    const crossfade = this._getCrossfadeDuration();
 
-    let howl;
-    howl = new Howl({
-      src: [source],
-      html5: true,
-      preload: true,
-      format: ['mp3', 'flac'],
-      onend: () => {
-        // 已经被替换掉的实例（交叉淡化中的旧实例）不再触发切歌
-        if (this._howler !== howl) return;
-        this._nextTrackCallback();
-      },
-    });
+    let howl = preloadedHowl;
+    if (!howl) {
+      howl = new Howl({
+        src: [source],
+        html5: true,
+        preload: true,
+        format: ['mp3', 'flac'],
+      });
+    }
     this._howler = howl;
+    this._bindHowlEvents(howl);
 
     // 交叉淡化：旧实例淡出后单独卸载。
     // 不使用 Howler.unload()（全局卸载会连带销毁预加载实例），
     // 也不会在切歌瞬间硬切造成可听见的爆音。
-    if (previous) {
+    if (previous && previous !== howl) {
+      const fadeOut = crossfade > 0 ? crossfade : TRACK_CROSSFADE_DURATION;
+      this._fadingHowler = previous;
       try {
         const fromVolume = previous.volume();
-        previous.fade(fromVolume, 0, TRACK_CROSSFADE_DURATION);
+        previous.fade(fromVolume, 0, fadeOut);
         setTimeout(() => {
-          try {
-            previous.unload();
-          } catch (e) {
-            /* already unloaded */
-          }
-        }, TRACK_CROSSFADE_DURATION + 60);
+          if (this._fadingHowler === previous) this._fadingHowler = null;
+          this._unloadHowl(previous);
+          // 淡出结束后旧实例不再持有 Blob URL，顺手回收更早的记录
+          this._trimBlobRecords();
+        }, fadeOut + 60);
       } catch (e) {
-        /* ignore */
+        this._fadingHowler = null;
       }
     }
 
+    if (autoplay) {
+      if (crossfade > 0) {
+        // 先静音再起播：howler 的 fade() 是 10ms 一档的定时器，
+        // 起播到第一次 fade 之间会有一个满音量的窗口，听起来是「咔」一声。
+        this._pendingFadeIn = crossfade;
+        howl.volume(0);
+      }
+      this.play();
+      if (this._currentTrack.name) {
+        setTitle(this._currentTrack);
+      }
+      setTrayLikeState(store.state.liked.songs.includes(this.currentTrack.id));
+      // 预载实例也可能是「加载过但已经失效」的（音源 URL 过期）。
+      // 这种情况下 howler 会一直停在 loading、play() 永远排队，
+      // 表现为播放按钮一直转圈，所以给一个有限次数的回退。
+      if (preloadedHowl) this._armPlayWatchdog(howl);
+    } else {
+      howl.volume(this.volume);
+      this._setLoadingNext(false);
+    }
+    this.setOutputDevice();
+    // 起播之后再预载下一首，避免抢走当前曲目自己的带宽
+    this._schedulePreload();
+  }
+  _bindHowlEvents(howl) {
+    if (!howl || howl._ypmBound) return;
+    howl._ypmBound = true;
+
+    howl.on('end', () => {
+      // 已经被替换掉的实例（交叉淡化中的旧实例）不再触发切歌
+      if (this._howler !== howl) return;
+      this._nextTrackCallback();
+    });
     howl.on('loaderror', (_, errCode) => {
       // 旧实例的加载错误不再影响当前播放
       if (this._howler !== howl) return;
+      this._setLoadingNext(false);
       // https://developer.mozilla.org/en-US/docs/Web/API/MediaError/code
       // code 3: MEDIA_ERR_DECODE
       if (errCode === 3) {
@@ -472,36 +574,107 @@ export default class {
         );
       }
     });
-    if (autoplay) {
-      this.play();
-      if (this._currentTrack.name) {
-        setTitle(this._currentTrack);
-      }
-      setTrayLikeState(store.state.liked.songs.includes(this.currentTrack.id));
-    } else {
-      howl.volume(this.volume);
+  }
+  /**
+   * 预载实例起播看门狗。
+   *
+   * 正常预载在提升之前就应该已经缓冲完毕，提升后 3s 还没出声，
+   * 基本可以确定这个音源已经失效（URL 过期 / 被 CDN 踢掉）。
+   * 此时回退到一次常规的取源流程：这条路径不会重新装看门狗，
+   * 所以最多重试一次，不会无限循环。
+   */
+  _armPlayWatchdog(howl) {
+    this._clearPlayWatchdog();
+    this._playWatchdog = setTimeout(() => {
+      this._playWatchdog = null;
+      if (this._howler !== howl) return;
+      // 用户自己按了暂停，不要因为「没声音」就去重新取源
+      if (!this._desiredPlaying) return;
+      if (this._playing || howl.playing()) return;
+      console.debug(
+        '[debug][Player.js] preload promote timeout, refetch source'
+      );
+      this._replaceCurrentTrackAudio(this.currentTrack, true, false).catch(
+        () => {}
+      );
+    }, PRELOAD_PROMOTE_TIMEOUT);
+  }
+  _clearPlayWatchdog() {
+    if (this._playWatchdog !== null) {
+      clearTimeout(this._playWatchdog);
+      this._playWatchdog = null;
     }
-    this.setOutputDevice();
+  }
+  _getCrossfadeDuration() {
+    const raw = Number(store.state.settings?.crossfadeDuration);
+    if (!Number.isFinite(raw) || raw <= 0) return 0;
+    // 设置项理论上是 0~3000，越界值直接夹住，避免一次错误的配置把淡变拉成几十秒
+    return Math.min(raw, 3000);
   }
   _getAudioSourceBlobURL(data) {
     // Create a new object URL.
     const source = URL.createObjectURL(new Blob([data]));
+    this.createdBlobRecords.push(source);
+    this._trimBlobRecords();
+    return source;
+  }
+  /**
+   * 回收不再被任何 howler 引用的 Blob URL。
+   *
+   * 原实现用 `for...in` 遍历数组，拿到的是下标字符串（"0"、"1"），
+   * URL.revokeObjectURL("0") 什么都不会释放，Blob 内存持续泄漏；
+   * 后来改成「只保留最近两个」，但引入预载之后同时存活的 URL 变成三个
+   * （当前 + 交叉淡化中 + 预载），按位置裁剪会 revoke 掉正在播放的那一个。
+   * 所以这里改成按「是否仍被实例引用」来判定，位置只用来决定回收顺序。
+   */
+  _trimBlobRecords() {
+    const inUse = new Set();
+    for (const howl of [
+      this._howler,
+      this._fadingHowler,
+      this._preload?.howl,
+    ]) {
+      const src = howl?._src;
+      if (typeof src === 'string') {
+        inUse.add(src);
+      } else if (Array.isArray(src)) {
+        src.forEach(s => inUse.add(s));
+      }
+    }
 
-    // 原实现用 `for...in` 遍历数组，拿到的是下标字符串（"0"、"1"），
-    // URL.revokeObjectURL("0") 什么都不会释放，Blob 内存持续泄漏；
-    // 而且每次都把上一次的 URL 全部 revoke，正在播放的那一个也会被回收。
-    // 现在保留最近两个实例（当前 + 交叉淡化中的），只回收更早的。
-    while (this.createdBlobRecords.length > 2) {
-      const stale = this.createdBlobRecords.shift();
+    while (this.createdBlobRecords.length > MAX_BLOB_URLS) {
+      const index = this.createdBlobRecords.findIndex(url => !inUse.has(url));
+      // 全都在用：宁可多留一份，也绝不回收正在播放的 URL
+      if (index === -1) return;
+      const [stale] = this.createdBlobRecords.splice(index, 1);
       try {
         URL.revokeObjectURL(stale);
       } catch (e) {
         /* ignore */
       }
     }
-    this.createdBlobRecords.push(source);
-
-    return source;
+  }
+  _unloadHowl(howl) {
+    if (!howl) return;
+    // 当前 / 正在淡出的实例由各自的生命周期负责卸载，这里绝不能碰
+    if (howl === this._howler || howl === this._fadingHowler) return;
+    try {
+      // 只调 howl.unload() 时，<audio> 节点有可能在后台继续把整首歌下载完，
+      // 直到 GC 才真正停下。先手动断开 src 才能真正释放掉这次预载。
+      const node = howl._sounds?.[0]?._node;
+      if (node) {
+        node.pause();
+        node.removeAttribute('src');
+        node.load();
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      howl.unload();
+    } catch (e) {
+      /* already unloaded */
+    }
   }
   _getAudioSourceFromCache(id) {
     return getTrackSource(id).then(t => {
@@ -618,19 +791,40 @@ export default class {
     this._replaceSeq = (this._replaceSeq || 0) + 1;
     const seq = this._replaceSeq;
 
+    // 记录发起切歌时的「暂停代数」：等待音源期间用户点了暂停，
+    // 音源就绪之后不应该再把声音放出来。
+    const pauseSeq = this._pauseSeq;
+
+    // 快路径：下一首已经在预载槽里，直接提升。
+    // 不需要歌单详情请求、不需要音源请求、不需要重新建 <audio> 节点，
+    // 整条链路是同步的，用户点下「下一首」的当帧就开始出声。
+    const preload = this._takePreload(id);
+    if (preload) {
+      this._currentTrack = preload.track;
+      this._updateMediaSessionMetaData(preload.track);
+      this._playAudioSource(
+        preload.source,
+        autoplay && pauseSeq === this._pauseSeq,
+        preload.howl
+      );
+      return Promise.resolve(true);
+    }
+
+    this._setLoadingNext(true);
     return getTrackDetail(id)
       .then(data => {
         if (seq !== this._replaceSeq) return false;
         const track = data?.songs?.[0];
         if (!track) {
           store.dispatch('showToast', `无法获取歌曲 ${id} 的信息`);
+          this._setLoadingNext(false);
           return false;
         }
         this._currentTrack = track;
         this._updateMediaSessionMetaData(track);
         return this._replaceCurrentTrackAudio(
           track,
-          autoplay,
+          autoplay && pauseSeq === this._pauseSeq,
           true,
           ifUnplayableThen
         );
@@ -640,6 +834,7 @@ export default class {
         console.warn('[Player] failed to load track detail', id, error);
         store.dispatch('showToast', '加载歌曲失败，请检查网络');
         this._setPlaying(false);
+        this._setLoadingNext(false);
         return false;
       });
   }
@@ -683,16 +878,195 @@ export default class {
       }
     });
   }
+  /**
+   * 预载下一首。
+   *
+   * 原实现只是把「下一首」的歌单详情和音源 URL 预热进 HTTP / Dexie 缓存，
+   * 但没有建立任何可播放实例，切歌时仍然要重新 new Howl 并等 canplaythrough，
+   * 弱网下这段时间就是用户听到的「点了下一首没反应」。
+   * 现在改成完整的单槽位预载（歌单详情 + 音源 + 已开始缓冲的 Howl 实例），
+   * 旧的缓存预热语义被完全包含在内。
+   */
   _cacheNextTrack() {
-    let nextTrackID = this._isPersonalFM
-      ? this._personalFMNextTrack?.id ?? 0
-      : this._getNextTrack()[0];
-    if (!nextTrackID) return;
-    if (this._personalFMTrack.id == nextTrackID) return;
-    getTrackDetail(nextTrackID).then(data => {
-      let track = data.songs[0];
-      this._getAudioSource(track);
-    });
+    this._schedulePreload();
+  }
+  /**
+   * 安排一次预载。
+   *
+   * 永远延迟执行：当前曲目刚起播时立刻去拉下一首会抢带宽，
+   * 弱网下反而推迟「多久能听见声音」。多次调用只会保留最后一次。
+   */
+  _schedulePreload(delay = PRELOAD_DELAY) {
+    this._clearPreloadTimer();
+    this._preloadTimer = setTimeout(() => {
+      this._preloadTimer = null;
+      this._preloadNextTrack();
+    }, delay);
+  }
+  _clearPreloadTimer() {
+    if (this._preloadTimer !== null) {
+      clearTimeout(this._preloadTimer);
+      this._preloadTimer = null;
+    }
+  }
+  /**
+   * 「下一首」到底是谁。
+   *
+   * 私人FM 用 _personalFMNextTrack（接口已经提前给了下一首的信息），
+   * 其余情况走 _getNextTrack()，与自动切歌 / 手动切歌用的是同一套规则
+   * （playNextList 优先、repeatMode=on 时回绕、reversed 反向）。
+   */
+  _getPreloadTarget() {
+    if (this._isPersonalFM) {
+      const id = this._personalFMNextTrack?.id ?? 0;
+      return id && id !== this.currentTrackID ? id : 0;
+    }
+    const [nextID] = this._getNextTrack();
+    if (!nextID || nextID === this.currentTrackID) return 0;
+    return nextID;
+  }
+  /**
+   * 丢弃预载槽位。
+   *
+   * 必须真的 unload()：howler 把实例挂在全局 Howler._howls 上，
+   * 不卸载就是「每切一首多一个 <audio> 节点 + 一个 Blob URL」，
+   * 正是之前修过一次的那类泄漏。
+   */
+  _invalidatePreload() {
+    // 序号 +1：仍在飞行中的预载任务拿到结果后会发现自己已经过期
+    this._preloadSeq += 1;
+    this._clearPreloadTimer();
+    const slot = this._preload;
+    this._preload = null;
+    if (!slot) return;
+    this._unloadHowl(slot.howl);
+    this._trimBlobRecords();
+  }
+  /**
+   * 用户操作导致「下一首」变了：丢掉旧预载，并为新的下一首重新预载。
+   *
+   * 只丢弃不重建会让「开随机 / 切循环模式 / 往队列插歌」之后的第一次切歌
+   * 退回慢路径 —— 而这些恰好都是用户马上就会点「下一首」的时刻。
+   * 还没有任何曲目被加载时不预载，避免冷启动就发起网络请求。
+   */
+  _refreshPreload() {
+    this._invalidatePreload();
+    if (this._howler) this._schedulePreload();
+  }
+  /**
+   * 取出预载实例用于提升。
+   *
+   * 只有「目标就是它」且「还没过期」才会返回；不匹配时保留槽位不动
+   * （用户可能只是点了别的歌，槽位里的那一首对后续仍然有意义），
+   * 由随后的 _preloadNextTrack() 判定要不要换。
+   */
+  _takePreload(trackID) {
+    const slot = this._preload;
+    if (!slot) return null;
+    if (slot.trackID !== trackID) return null;
+    if (Date.now() - slot.createdAt > PRELOAD_MAX_AGE) {
+      this._invalidatePreload();
+      return null;
+    }
+    this._clearPreloadTimer();
+    this._preload = null;
+    // 让仍在飞行中的预载任务失效，避免它把槽位又填回去
+    this._preloadSeq += 1;
+    return slot;
+  }
+  _preloadNextTrack() {
+    const targetID = this._getPreloadTarget();
+    if (!targetID) {
+      this._invalidatePreload();
+      return Promise.resolve(null);
+    }
+
+    const slot = this._preload;
+    if (
+      slot &&
+      slot.trackID === targetID &&
+      Date.now() - slot.createdAt < PRELOAD_MAX_AGE
+    ) {
+      return Promise.resolve(slot);
+    }
+
+    // 目标变了：先清掉旧槽位，保证同一时刻最多只有一个预载实例
+    this._invalidatePreload();
+    const seq = ++this._preloadSeq;
+
+    return getTrackDetail(targetID)
+      .then(data => {
+        if (seq !== this._preloadSeq) return null;
+        const track = data?.songs?.[0];
+        if (!track) return null;
+        return this._getAudioSource(track).then(source => {
+          if (!source) return null;
+          // 走的是和正常播放完全相同的音源获取路径：
+          // 优先命中 src/utils/db.js 的缓存并生成 Blob URL，
+          // 所以预载既不会绕过缓存，也不会额外多下一遍音频。
+          const howl = new Howl({
+            src: [source],
+            html5: true,
+            preload: true,
+            format: ['mp3', 'flac'],
+          });
+          // 预载实例不出声：音量跟随用户设置，真正提升时再按需从 0 淡入
+          howl.volume(this.volume);
+
+          if (seq !== this._preloadSeq) {
+            this._unloadHowl(howl);
+            this._trimBlobRecords();
+            return null;
+          }
+
+          // 预载期间音源就失败了：立刻丢掉，别让提升路径拿到一个永远
+          // 起不来的实例（那会表现为播放按钮一直转圈）。
+          howl.once('loaderror', () => {
+            if (this._preload?.howl === howl) this._invalidatePreload();
+          });
+
+          this._preload = {
+            trackID: targetID,
+            track,
+            source,
+            howl,
+            createdAt: Date.now(),
+          };
+          this._trimBlobRecords();
+          return this._preload;
+        });
+      })
+      .catch(error => {
+        console.debug('[debug][Player.js] preload next track failed', error);
+        return null;
+      });
+  }
+  _setLoadingNext(isLoading) {
+    if (this._loadingTimer !== null) {
+      clearTimeout(this._loadingTimer);
+      this._loadingTimer = null;
+    }
+    this._loadingNext = isLoading;
+    if (!isLoading) return;
+    // 兜底：网络挂死、序号被后续切歌顶掉等异常路径都不应该让按钮一直转圈
+    this._loadingTimer = setTimeout(() => {
+      this._loadingTimer = null;
+      this._loadingNext = false;
+    }, LOADING_NEXT_TIMEOUT);
+  }
+  /**
+   * 用户主动 seek 之后对预载槽位的处理。
+   *
+   * 已经缓冲完成的预载仍然有效，没必要因为一次 seek 就丢掉；
+   * 还在缓冲中的预载会和 seek 触发的 range 请求抢带宽，
+   * 而且拖动进度条会连续触发 seek，所以这里丢掉它、松手后再重新预载。
+   */
+  _onUserSeek() {
+    const slot = this._preload;
+    if (slot && slot.howl?._state !== 'loaded') {
+      this._invalidatePreload();
+    }
+    this._schedulePreload(SEEK_PRELOAD_DELAY);
   }
   _loadSelfFromLocalStorage() {
     const player = JSON.parse(localStorage.getItem('player'));
@@ -873,6 +1247,8 @@ export default class {
     const list = this.list;
     if (!Array.isArray(list)) return;
     list.push(trackID);
+    // 列表变了，「下一首」可能跟着变，预载作废并重建
+    this._refreshPreload();
     this.saveSelfToLocalStorage();
   }
   /**
@@ -891,6 +1267,7 @@ export default class {
     if (this._shuffle && !this._shuffledList.includes(track.id)) {
       this._shuffledList.push(track.id);
     }
+    this._refreshPreload();
     this.saveSelfToLocalStorage();
     if (playNow) {
       this.current = this.list.indexOf(track.id);
@@ -898,11 +1275,11 @@ export default class {
     }
   }
   playNextTrack() {
-    // TODO: 切换歌曲时增加加载中的状态
     const [trackID, index] = this._getNextTrack();
     if (trackID === undefined) {
       this._howler?.stop();
       this._setPlaying(false);
+      this._setLoadingNext(false);
       return false;
     }
     let next = index;
@@ -1015,6 +1392,8 @@ export default class {
     // 记录用户意图：淡出期间如果又点了播放，这一次暂停要放弃，
     // 否则会出现「点了播放但 200ms 后被暂停」的竞态。
     this._desiredPlaying = false;
+    // 暂停代数 +1：还在等音源的那次切歌不应该在音源就绪后把声音放出来
+    this._pauseSeq += 1;
     const howl = this._howler;
     if (!howl) {
       this._setPlaying(false);
@@ -1045,6 +1424,7 @@ export default class {
     if (howl.playing()) {
       howl.fade(howl.volume(), this.volume, PLAY_PAUSE_FADE_DURATION);
       this._setPlaying(true);
+      this._setLoadingNext(false);
       if (this._currentTrack.name) {
         setTitle(this._currentTrack);
       }
@@ -1055,10 +1435,17 @@ export default class {
 
     howl.once('play', () => {
       if (this._howler !== howl) return;
+      // 音源已经就绪：加载态到此结束（无论接下来是否真的出声）
+      this._setLoadingNext(false);
+      this._clearPlayWatchdog();
       // 取源/解码期间用户可能已经点了暂停，此时不要再把音量淡回来，
       // 否则会出现「点了暂停，200ms 后声音又响了一下」
       if (!this._desiredPlaying) return;
-      howl.fade(0, this.volume, PLAY_PAUSE_FADE_DURATION);
+
+      // 交叉淡化用设置里的时长，普通播放 / 恢复沿用 200ms
+      const fadeIn = this._pendingFadeIn ?? PLAY_PAUSE_FADE_DURATION;
+      this._pendingFadeIn = null;
+      howl.fade(0, this.volume, fadeIn);
 
       // 播放时确保开启player.
       // 避免因"忘记设置"导致在播放时播放器不显示的Bug
@@ -1097,6 +1484,7 @@ export default class {
       this._howler?.seek(time);
       if (this._playing)
         this._playDiscordPresence(this._currentTrack, this.seek(null, false));
+      this._onUserSeek();
     }
     return this._howler === null ? 0 : this._howler.seek();
   }
@@ -1108,11 +1496,48 @@ export default class {
       this.volume = 0;
     }
   }
+  /**
+   * 把当前音频节点切到设置里选的输出设备。
+   *
+   * 原实现直接 `_node.setSinkId(store.state.settings.outputDevice)`：
+   * 1. setSinkId 返回 Promise，设备被拔掉时会 reject，没有 catch 就是每次
+   *    切歌都往控制台丢一个 unhandled rejection；
+   * 2. 默认值 'default' 并不是合法的 sinkId（规范里只有 '' 表示系统默认），
+   *    所以「默认设备」这个最常见的情况其实每次都在失败；
+   * 3. 任何同步异常都会顺着 _playAudioSource 冒出去，直接打断切歌。
+   * 现在：非法/默认值归一成 ''，已经是目标设备就跳过，失败回退一次系统默认，
+   * 并且保证不抛。
+   */
   setOutputDevice() {
-    if (this._howler?._sounds.length <= 0 || !this._howler?._sounds[0]._node) {
-      return;
-    }
-    this._howler?._sounds[0]._node.setSinkId(store.state.settings.outputDevice);
+    const node = this._howler?._sounds?.[0]?._node;
+    // 非 Electron / 老版本 Chromium 没有 setSinkId，跳过
+    if (!node || typeof node.setSinkId !== 'function') return;
+
+    const configured = store.state.settings?.outputDevice;
+    // 'default' / 空值都表示「系统默认设备」，Chromium 只认空字符串
+    const sinkId = !configured || configured === 'default' ? '' : configured;
+    // 新创建的 <audio> 本来就挂在系统默认设备上，没必要再切一次
+    if (node.sinkId === sinkId) return;
+
+    const applySinkId = id => {
+      try {
+        const result = node.setSinkId(id);
+        return result && typeof result.catch === 'function'
+          ? result
+          : Promise.resolve();
+      } catch (e) {
+        return Promise.reject(e);
+      }
+    };
+
+    applySinkId(sinkId).catch(() => {
+      // 回退到系统默认设备本身也失败时放弃，不要无限重试
+      if (sinkId === '') return;
+      console.debug(
+        '[debug][Player.js] setSinkId failed, falling back to system default'
+      );
+      applySinkId('').catch(() => {});
+    });
   }
 
   replacePlaylist(
@@ -1122,6 +1547,8 @@ export default class {
     autoPlayTrackID = 'first'
   ) {
     this._isPersonalFM = false;
+    // 整个播放列表换掉了，槽位里的「下一首」一定不属于新列表
+    this._refreshPreload();
     this.list = trackIDs;
     this.current = 0;
     this._playlistSource = {
@@ -1180,6 +1607,8 @@ export default class {
   }
   addTrackToPlayNext(trackID, playNow = false) {
     this._playNextList.push(trackID);
+    // 「下一首」被插队了，之前的预载不再是要播的那一首
+    this._refreshPreload();
     if (playNow) {
       this.playNextTrack();
     }
@@ -1234,8 +1663,11 @@ export default class {
 
   clearPlayNextList() {
     this._playNextList = [];
+    // 「下一首」回到列表里的下一首，预载作废并重建
+    this._refreshPreload();
   }
   removeTrackFromQueue(index) {
     this._playNextList.splice(index, 1);
+    this._refreshPreload();
   }
 }

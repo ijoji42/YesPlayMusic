@@ -28,15 +28,14 @@
 <script>
 import ModalAddTrackToPlaylist from './components/ModalAddTrackToPlaylist.vue';
 import ModalNewPlaylist from './components/ModalNewPlaylist.vue';
-import CommandPalette, {
-  isEditableTarget,
-} from './components/CommandPalette.vue';
+import CommandPalette from './components/CommandPalette.vue';
 import Scrollbar from './components/Scrollbar.vue';
 import Navbar from './components/Navbar.vue';
 import Player from './components/Player.vue';
 import Toast from './components/Toast.vue';
 import { ipcRenderer } from './electron/ipcRenderer';
 import { isAccountLoggedIn, isLooseLoggedIn } from '@/utils/auth';
+import { isEditableTarget } from '@/utils/common';
 import Lyrics from './views/lyrics.vue';
 import { mapState } from 'vuex';
 

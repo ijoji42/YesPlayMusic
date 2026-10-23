@@ -76,6 +76,7 @@
 
 <script>
 import { mapState } from 'vuex';
+import { isEditableTarget } from '@/utils/common';
 
 const GROUP_ACTION = 'action';
 const GROUP_NAVIGATE = 'navigate';
@@ -84,22 +85,6 @@ const GROUP_SEARCH = 'search';
 // 命令面板最多同时展示多少条本地命令；超过这个数就不再插入「搜索」行，
 // 避免用户已经能用本地命令表达意图时，被一条会跳走的搜索结果抢走回车。
 const LOCAL_RESULTS_ENOUGH = 3;
-
-/**
- * 焦点在可编辑元素里时，全局快捷键必须让位给原生行为：
- * 空格是打字、是展开 <select>，不是播放/暂停。
- * App.vue 的 Space 处理与命令面板的 Cmd/Ctrl+K 共用这套判断。
- */
-export function isEditableTarget(target) {
-  if (!target || !target.tagName) return false;
-  const tagName = target.tagName;
-  return (
-    tagName === 'INPUT' ||
-    tagName === 'TEXTAREA' ||
-    tagName === 'SELECT' ||
-    target.isContentEditable === true
-  );
-}
 
 export default {
   name: 'CommandPalette',

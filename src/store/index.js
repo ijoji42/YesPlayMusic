@@ -73,6 +73,20 @@ const TRANSIENT_PROPS = new Set([
   '_replaceSeq',
   '_mprisListener',
   'createdBlobRecords',
+  // 下一首预载槽位与相关调度句柄：只描述「运行时正在发生什么」，
+  // 既不该落盘（里面是 Howl 实例和 Blob URL，序列化出来就是垃圾），
+  // 也不该触发 IPC 同步。
+  '_preload',
+  '_preloadSeq',
+  '_preloadTimer',
+  '_playWatchdog',
+  // 切歌加载态与淡入淡出调度：
+  // _loadingNext 变化只驱动播放按钮上的加载环，不需要落盘，
+  // 更不需要把托盘 / MPRIS 唤醒一次。
+  '_loadingNext',
+  '_loadingTimer',
+  '_pendingFadeIn',
+  '_pauseSeq',
 ]);
 
 /**
