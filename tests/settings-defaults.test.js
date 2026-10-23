@@ -18,10 +18,14 @@ describe('store.initLocalStorage', () => {
       Object.prototype.hasOwnProperty.call(settings, 'lyricsBackground'),
       'settings.lyricsBackground is missing'
     );
-    // `src/views/lyrics.vue` renders the background only when this value is
-    // one of the three mode strings, and `settings.vue` still exposes a plain
-    // on/off toggle. Accept either shape so a deliberate migration in one of
-    // those two files does not turn into a red build here, but reject typos.
+    // `src/views/lyrics.vue` has four distinct modes for this key:
+    //   false                    -> no background
+    //   true                     -> .gradient-background (cover-colour gradient)
+    //   'blur' | 'dynamic'       -> .lyrics-background (blurred cover)
+    //   'reactive'               -> .lyrics-background + audio-reactive vars
+    // All four render something, so assert the default is one of them rather
+    // than pinning a specific value — a typo (e.g. 'Blur') would render nothing
+    // at all and is exactly what this guards against.
     const value = settings.lyricsBackground;
     const modes = ['blur', 'dynamic', 'reactive'];
     assert.ok(
