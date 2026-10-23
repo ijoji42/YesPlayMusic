@@ -498,6 +498,44 @@ class Background {
     });
   }
 
+  /**
+   * Chromium 在拿到「媒体权限」之前，enumerateDevices() 返回的 label 是空字符串，
+   * 设置页就只能显示一串没有名字的输出设备。Electron 的 session 默认不授予这个
+   * 权限，所以这里只针对「音频枚举」放行。
+   *
+   * 注意：我们并不会调用 getUserMedia，因此不会真的打开麦克风，
+   * 只是让设备名变得可见。
+   *
+   * 其他权限一律返回 true，保持 Electron 的默认（放行）行为，
+   * 避免把剪贴板、通知之类的既有功能误伤。
+   */
+  allowAudioDeviceLabels() {
+    if (!this.window || this.window.isDestroyed()) return;
+    const ses = this.window.webContents.session;
+    if (!ses) return;
+
+    try {
+      if (typeof ses.setPermissionCheckHandler === 'function') {
+        ses.setPermissionCheckHandler((wc, permission, origin, details) => {
+          if (permission !== 'media') return true;
+          const mediaType = details && details.mediaType;
+          // 只放行音频；摄像头一律拒绝
+          return mediaType === 'audio' || mediaType === undefined;
+        });
+      }
+      if (typeof ses.setPermissionRequestHandler === 'function') {
+        ses.setPermissionRequestHandler((wc, permission, callback, details) => {
+          if (permission !== 'media') return callback(true);
+          const mediaTypes = (details && details.mediaTypes) || [];
+          const wantsVideo = mediaTypes.indexOf('video') !== -1;
+          callback(!wantsVideo);
+        });
+      }
+    } catch (e) {
+      log('allowAudioDeviceLabels failed', e);
+    }
+  }
+
   handleAppEvents() {
     app.on('ready', async () => {
       // This method will be called when Electron has finished
@@ -516,6 +554,7 @@ class Background {
         this.window.show();
       });
       this.handleWindowEvents();
+      this.allowAudioDeviceLabels();
 
       // create tray
       if (isCreateTray) {

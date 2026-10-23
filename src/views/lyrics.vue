@@ -7,12 +7,15 @@
     >
       <div
         v-if="
-          (settings.lyricsBackground === 'blur') |
-            (settings.lyricsBackground === 'dynamic')
+          settings.lyricsBackground === 'blur' ||
+          settings.lyricsBackground === 'dynamic' ||
+          settings.lyricsBackground === 'reactive'
         "
+        ref="lyricsBackground"
         class="lyrics-background"
         :class="{
           'dynamic-background': settings.lyricsBackground === 'dynamic',
+          'reactive-background': settings.lyricsBackground === 'reactive',
         }"
       >
         <div
@@ -299,6 +302,14 @@ import * as Vibrant from 'node-vibrant/dist/vibrant.worker.min.js';
 import Color from 'color';
 import { isAccountLoggedIn } from '@/utils/auth';
 import { hasListSource, getListSourcePath } from '@/utils/playList';
+import {
+  subscribe,
+  setReactiveConfig,
+  mapFrameToVars,
+  supportsReactive,
+  normalizeReactiveConfig,
+  DEFAULT_REACTIVE_CONFIG,
+} from '@/utils/audioAnalyser';
 import locale from '@/locale';
 
 const electron =
@@ -326,6 +337,12 @@ export default {
       date: this.formatTime(new Date()),
       isFullscreen: !!document.fullscreenElement,
       rightClickLyric: null,
+      // 律动背景的运行时状态：不进 Vuex，避免每帧触发整页重渲染
+      reactiveUnsubscribe: null,
+      reactiveConfig: normalizeReactiveConfig(
+        this.$store.state.settings.lyricsReactive || DEFAULT_REACTIVE_CONFIG
+      ),
+      reactiveDegraded: false,
     };
   },
   computed: {
@@ -436,11 +453,38 @@ export default {
     theme() {
       return this.settings.lyricsBackground === true ? 'dark' : 'auto';
     },
+    // 只有「律动模式 + 歌词页可见 + 正在播放 + 环境支持 Web Audio」
+    // 四个条件同时成立时才跑 rAF 循环。关掉任何一个条件都会立刻停掉，
+    // 这一点可以用 DevTools 的 Performance 面板验证。
+    shouldRunReactive() {
+      return (
+        this.settings.lyricsBackground === 'reactive' &&
+        this.showLyrics === true &&
+        this.player.playing === true &&
+        supportsReactive()
+      );
+    },
   },
   watch: {
     currentTrack() {
       this.getLyric();
       this.getCoverColor();
+    },
+    shouldRunReactive(run) {
+      if (run) {
+        this.startReactiveLoop();
+      } else {
+        this.stopReactiveLoop();
+      }
+    },
+    'settings.lyricsReactive': {
+      deep: true,
+      handler(value) {
+        this.reactiveConfig = normalizeReactiveConfig(value);
+        setReactiveConfig(this.reactiveConfig);
+        // 让改动立刻体现在画面上，不必等下一帧
+        this.applyReactiveFrame(null);
+      },
     },
     showLyrics(show) {
       if (show) {
@@ -482,14 +526,76 @@ export default {
     if (this.timer) {
       clearInterval(this.timer);
     }
+    this.stopReactiveLoop();
     this.exitFullscreen();
+  },
+  mounted() {
+    // 如果挂载时就已经满足条件（比如从上次会话直接进歌词页），立刻接上
+    if (this.shouldRunReactive) this.startReactiveLoop();
   },
   destroyed() {
     clearInterval(this.lyricsInterval);
+    this.stopReactiveLoop();
   },
   methods: {
     ...mapMutations(['toggleLyrics', 'updateModal']),
     ...mapActions(['likeATrack']),
+    /**
+     * 启动律动循环。注意 rAF 循环本身由 audioAnalyser 统一管理：
+     * 设置页的预览块和歌词页共用同一个循环，两边都退订后循环才真正停下。
+     */
+    startReactiveLoop() {
+      this.stopReactiveLoop();
+      // v-if 渲染的背景元素要等 DOM 更新后才拿得到
+      this.$nextTick(() => {
+        if (!this.shouldRunReactive) return;
+        if (!this.$refs.lyricsBackground) return;
+        this.reactiveDegraded = false;
+        setReactiveConfig(this.reactiveConfig);
+        this.reactiveUnsubscribe = subscribe(frame => {
+          if (frame.degraded) {
+            // 频谱读不到（跨域音源 / 解码失败）：只写一次静态值然后停手，
+            // 但保持订阅，音频恢复后能自己接回来。
+            if (!this.reactiveDegraded) {
+              this.reactiveDegraded = true;
+              this.applyReactiveFrame(null);
+            }
+            return;
+          }
+          if (this.reactiveDegraded) this.reactiveDegraded = false;
+          this.applyReactiveFrame(frame);
+        });
+      });
+    },
+    stopReactiveLoop() {
+      if (this.reactiveUnsubscribe) {
+        this.reactiveUnsubscribe();
+        this.reactiveUnsubscribe = null;
+      }
+      this.reactiveDegraded = false;
+      const stage = this.$refs.lyricsBackground;
+      if (!stage) return;
+      // 清掉自定义属性，让 CSS 里的 var() 回退值（静态模糊）接管
+      [
+        '--react-scale',
+        '--react-blur',
+        '--react-brightness',
+        '--react-saturate',
+        '--react-hue',
+        '--react-pulse',
+      ].forEach(key => stage.style.removeProperty(key));
+    },
+    applyReactiveFrame(frame) {
+      const stage = this.$refs.lyricsBackground;
+      if (!stage) return;
+      const vars = mapFrameToVars(
+        frame || { level: 0, pulse: 0 },
+        this.reactiveConfig
+      );
+      Object.keys(vars).forEach(key => {
+        stage.style.setProperty(key, vars[key]);
+      });
+    },
     initDate() {
       var _this = this;
       clearInterval(this.timer);
@@ -791,6 +897,40 @@ export default {
 
 .dynamic-background > div {
   animation: rotate 150s linear infinite;
+}
+
+// 律动背景。和 .lyrics-background 是同一个元素，靠更高优先级覆盖 filter。
+// 只动 transform 与 filter 这两个合成层属性，不碰 width/margin/top，
+// 避免每帧触发布局重排。
+.lyrics-background.reactive-background {
+  // 用纯数字而不是百分比，这样 calc() 里做乘法是安全的
+  --react-base-brightness: 1.5;
+  --react-base-contrast: 0.75;
+
+  filter: blur(var(--react-blur, 50px))
+    contrast(calc(var(--react-base-contrast) * var(--react-contrast, 1)))
+    brightness(calc(var(--react-base-brightness) * var(--react-brightness, 1)))
+    saturate(var(--react-saturate, 1)) hue-rotate(var(--react-hue, 0deg));
+  transition: filter 80ms linear;
+  will-change: filter;
+}
+
+[data-theme='dark'] .lyrics-background.reactive-background {
+  --react-base-brightness: 0.5;
+  --react-base-contrast: 1.25;
+}
+
+.lyrics-background.reactive-background > div {
+  transform: scale(var(--react-scale, 1));
+  transition: transform 80ms linear;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lyrics-background.reactive-background,
+  .lyrics-background.reactive-background > div {
+    transition: none;
+  }
 }
 
 @keyframes rotate {

@@ -1,5 +1,17 @@
 <template>
   <div class="settings-page" @click="clickOutside">
+    <nav class="settings-nav" :aria-label="$t('settings.groups.general')">
+      <button
+        v-for="group in groups"
+        :key="group.key"
+        class="nav-item"
+        :class="{ active: activeGroup === group.key }"
+        type="button"
+        @click="scrollToGroup(group.key)"
+      >
+        {{ $t(group.label) }}
+      </button>
+    </nav>
     <div class="container">
       <div v-if="showUserInfo" class="user">
         <div class="left">
@@ -27,6 +39,7 @@
         </div>
       </div>
 
+      <div id="settings-anchor-general" class="settings-anchor"></div>
       <div class="item">
         <div class="left">
           <div class="title"> {{ $t('settings.language') }} </div>
@@ -40,6 +53,7 @@
           </select>
         </div>
       </div>
+      <div id="settings-anchor-appearance" class="settings-anchor"></div>
       <div class="item">
         <div class="left">
           <div class="title"> {{ $t('settings.appearance.text') }} </div>
@@ -89,6 +103,7 @@
           </select>
         </div>
       </div>
+      <div id="settings-anchor-library" class="settings-anchor"></div>
       <div class="item">
         <div class="left">
           <div class="title">
@@ -116,7 +131,7 @@
         </div>
       </div>
 
-      <!-- <h3>音质</h3> -->
+      <div id="settings-anchor-playback" class="settings-anchor"></div>
       <div class="item">
         <div class="left">
           <div class="title"> {{ $t('settings.musicQuality.text') }} </div>
@@ -142,21 +157,33 @@
       <div v-if="isElectron" class="item">
         <div class="left">
           <div class="title"> {{ $t('settings.deviceSelector') }} </div>
+          <div v-if="deviceNotice" class="subtitle device-notice">
+            {{ deviceNotice }}
+          </div>
         </div>
-        <div class="right">
+        <div class="right device-right">
           <select v-model="outputDevice">
             <option
               v-for="device in allOutputDevices"
               :key="device.deviceId"
               :value="device.deviceId"
-              :selected="device.deviceId == outputDevice"
             >
-              {{ $t(device.label) }}
+              {{ device.label }}
             </option>
           </select>
+          <button
+            class="refresh-devices"
+            type="button"
+            :title="$t('settings.refreshDevices')"
+            :aria-label="$t('settings.refreshDevices')"
+            @click="getAllOutputDevices(true)"
+          >
+            ↻
+          </button>
         </div>
       </div>
 
+      <div id="settings-anchor-system" class="settings-anchor"></div>
       <h3 v-if="isElectron">{{ $t('settings.cache') }}</h3>
       <div v-if="isElectron" class="item">
         <div class="left">
@@ -211,6 +238,7 @@
         </div>
       </div>
 
+      <div id="settings-anchor-lyrics" class="settings-anchor"></div>
       <h3>{{ $t('settings.lyric') }}</h3>
       <div class="item">
         <div class="left">
@@ -244,7 +272,20 @@
             <option value="dynamic">
               {{ $t('settings.lyricsBackground.dynamic') }}
             </option>
+            <option value="reactive">
+              {{ $t('settings.lyricsBackground.reactive') }}
+            </option>
           </select>
+        </div>
+      </div>
+      <div v-if="lyricsBackground === 'reactive'" class="item item-expanded">
+        <div class="left">
+          <div class="title">
+            {{ $t('settings.lyricsReactive.title') }}
+          </div>
+        </div>
+        <div class="right right-expanded">
+          <settings-reactive />
         </div>
       </div>
       <div class="item">
@@ -480,6 +521,7 @@
         </div>
       </section>
 
+      <div id="settings-anchor-others" class="settings-anchor"></div>
       <h3>{{ $t('settings.customization') }}</h3>
       <div class="item">
         <div class="left">
@@ -817,6 +859,8 @@ import {
   bytesToSize,
 } from '@/utils/common';
 import { countDBSize, clearDB } from '@/utils/db';
+import SettingsReactive from '@/components/SettingsReactive.vue';
+import locale from '@/locale';
 import pkg from '../../package.json';
 
 const electron =
@@ -828,18 +872,27 @@ const validShortcutCodes = ['=', '-', '~', '[', ']', ';', "'", ',', '.', '/'];
 
 export default {
   name: 'Settings',
+  components: { SettingsReactive },
   data() {
     return {
       tracksCache: {
         size: '0KB',
         length: 0,
       },
-      allOutputDevices: [
-        {
-          deviceId: 'default',
-          label: 'settings.permissionRequired',
-        },
+      allOutputDevices: [],
+      deviceNotice: '',
+      deviceNoticeTimer: null,
+      groups: [
+        { key: 'general', label: 'settings.groups.general' },
+        { key: 'appearance', label: 'settings.groups.appearance' },
+        { key: 'library', label: 'settings.groups.library' },
+        { key: 'playback', label: 'settings.groups.playback' },
+        { key: 'system', label: 'settings.groups.system' },
+        { key: 'lyrics', label: 'settings.groups.lyrics' },
+        { key: 'integrations', label: 'settings.groups.integrations' },
+        { key: 'others', label: 'settings.others' },
       ],
+      activeGroup: 'general',
       shortcutInput: {
         id: '',
         type: '',
@@ -1358,33 +1411,206 @@ export default {
   },
   created() {
     this.countDBSize('tracks');
-    if (process.env.IS_ELECTRON) this.getAllOutputDevices();
+    if (process.env.IS_ELECTRON) {
+      this.getAllOutputDevices();
+      this.bindDeviceChange();
+    }
   },
   activated() {
     this.countDBSize('tracks');
-    if (process.env.IS_ELECTRON) this.getAllOutputDevices();
+    if (process.env.IS_ELECTRON) {
+      this.getAllOutputDevices();
+      this.bindDeviceChange();
+    }
+  },
+  deactivated() {
+    this.unbindDeviceChange();
+  },
+  mounted() {
+    this.bindGroupScroll();
+  },
+  beforeDestroy() {
+    this.unbindDeviceChange();
+    this.unbindGroupScroll();
+    if (this.deviceNoticeTimer) clearTimeout(this.deviceNoticeTimer);
   },
   methods: {
     ...mapActions(['showToast']),
-    getAllOutputDevices() {
-      navigator.mediaDevices.enumerateDevices().then(devices => {
-        this.allOutputDevices = devices.filter(device => {
-          return device.kind == 'audiooutput';
-        });
-        if (
-          this.allOutputDevices.length > 0 &&
-          this.allOutputDevices[0].label !== ''
-        ) {
-          this.withoutAudioPriviledge = false;
-        } else {
-          this.allOutputDevices = [
-            {
-              deviceId: 'default',
-              label: 'settings.permissionRequired',
-            },
-          ];
-        }
+    // -----------------------------------------------------------------
+    // 音频输出设备
+    //
+    // 老实现只在 created/activated 时枚举一次，所以插上新的耳机/声卡后
+    // 设置里看不到，必须重启应用。这里补上 devicechange 监听，
+    // 并且不再在「拿不到设备名」时把整个列表覆盖成一条占位项
+    // （那个写法会让真实设备永久消失，直到重启）。
+    // -----------------------------------------------------------------
+    bindDeviceChange() {
+      const mediaDevices = navigator.mediaDevices;
+      if (!mediaDevices || this.deviceChangeHandler) return;
+      this.deviceChangeHandler = () => {
+        this.getAllOutputDevices();
+      };
+      if (mediaDevices.addEventListener) {
+        mediaDevices.addEventListener('devicechange', this.deviceChangeHandler);
+      } else if (mediaDevices.ondevicechange !== undefined) {
+        // 老版本 Chromium 只有 ondevicechange
+        this.previousOnDeviceChange = mediaDevices.ondevicechange;
+        mediaDevices.ondevicechange = this.deviceChangeHandler;
+      }
+    },
+    unbindDeviceChange() {
+      const mediaDevices = navigator.mediaDevices;
+      if (!mediaDevices || !this.deviceChangeHandler) return;
+      if (mediaDevices.removeEventListener) {
+        mediaDevices.removeEventListener(
+          'devicechange',
+          this.deviceChangeHandler
+        );
+      } else if (mediaDevices.ondevicechange !== undefined) {
+        mediaDevices.ondevicechange = this.previousOnDeviceChange || null;
+      }
+      this.deviceChangeHandler = null;
+    },
+    setDeviceNotice(text) {
+      this.deviceNotice = text;
+      if (this.deviceNoticeTimer) clearTimeout(this.deviceNoticeTimer);
+      this.deviceNoticeTimer = setTimeout(() => {
+        this.deviceNotice = '';
+        this.deviceNoticeTimer = null;
+      }, 6000);
+    },
+    async getAllOutputDevices(manual = false) {
+      const mediaDevices = navigator.mediaDevices;
+      if (
+        !mediaDevices ||
+        typeof mediaDevices.enumerateDevices !== 'function'
+      ) {
+        this.allOutputDevices = [
+          {
+            deviceId: 'default',
+            label: locale.t('settings.permissionRequired'),
+          },
+        ];
+        return;
+      }
+
+      let devices = [];
+      try {
+        devices = await mediaDevices.enumerateDevices();
+      } catch (e) {
+        return;
+      }
+
+      const previousIds = this.allOutputDevices.map(d => d.deviceId);
+      const hadRealList =
+        previousIds.length > 1 ||
+        (previousIds.length === 1 && previousIds[0] !== 'default');
+
+      const list = devices
+        .filter(device => device.kind === 'audiooutput')
+        .map((device, index) => ({
+          deviceId: device.deviceId,
+          // label 为空表示还没拿到设备名（权限未授予）。用序号占位，
+          // 至少让用户能选到「第 2 个输出设备」，而不是看到空白。
+          label:
+            device.label ||
+            locale.t('settings.deviceLabelFallback', { n: index + 1 }),
+        }));
+
+      // 系统默认设备排最前
+      list.sort((a, b) => {
+        const aIsDefault = a.deviceId === 'default' || a.deviceId === '';
+        const bIsDefault = b.deviceId === 'default' || b.deviceId === '';
+        if (aIsDefault === bIsDefault) return 0;
+        return aIsDefault ? -1 : 1;
       });
+
+      if (list.length === 0) {
+        this.allOutputDevices = [
+          {
+            deviceId: 'default',
+            label: locale.t('settings.permissionRequired'),
+          },
+        ];
+        return;
+      }
+
+      // 热插拔提示：只有「原本已经有一份真实列表」时才算新增，
+      // 否则首次枚举会把所有设备都当成新插入的。
+      if (hadRealList && !manual) {
+        const added = list.filter(d => previousIds.indexOf(d.deviceId) === -1);
+        if (added.length > 0) {
+          this.setDeviceNotice(
+            locale.t('settings.deviceHotplugFound', { name: added[0].label })
+          );
+        }
+      }
+
+      this.allOutputDevices = list;
+
+      // 原来选中的设备被拔掉了 → 回落到系统默认并提示，
+      // 而不是静默失败（setSinkId 会抛未捕获的 Promise 拒绝）
+      const selected = this.settings.outputDevice;
+      if (
+        selected &&
+        selected !== 'default' &&
+        !list.some(d => d.deviceId === selected)
+      ) {
+        this.$store.commit('changeOutputDevice', 'default');
+        this.player.setOutputDevice();
+        this.setDeviceNotice(locale.t('settings.deviceCurrentMissing'));
+      }
+    },
+    // -----------------------------------------------------------------
+    // 分组导航
+    // -----------------------------------------------------------------
+    bindGroupScroll() {
+      // 设置页的滚动容器是 App.vue 里的 <main>，不是本组件
+      this.scrollContainer = this.$el.closest('main') || window;
+      this.groupScrollHandler = () => {
+        if (this.groupScrollRaf) return;
+        this.groupScrollRaf = requestAnimationFrame(() => {
+          this.groupScrollRaf = null;
+          this.updateActiveGroup();
+        });
+      };
+      this.scrollContainer.addEventListener('scroll', this.groupScrollHandler, {
+        passive: true,
+      });
+      this.updateActiveGroup();
+    },
+    unbindGroupScroll() {
+      if (this.groupScrollRaf) {
+        cancelAnimationFrame(this.groupScrollRaf);
+        this.groupScrollRaf = null;
+      }
+      if (this.scrollContainer && this.groupScrollHandler) {
+        this.scrollContainer.removeEventListener(
+          'scroll',
+          this.groupScrollHandler
+        );
+      }
+      this.scrollContainer = null;
+      this.groupScrollHandler = null;
+    },
+    updateActiveGroup() {
+      // 取「已经滚过顶部的最后一个锚点」作为当前分组
+      let current = this.groups[0].key;
+      for (let i = 0; i < this.groups.length; i++) {
+        const el = document.getElementById(
+          `settings-anchor-${this.groups[i].key}`
+        );
+        if (!el) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.top <= 120) current = this.groups[i].key;
+      }
+      this.activeGroup = current;
+    },
+    scrollToGroup(key) {
+      const el = document.getElementById(`settings-anchor-${key}`);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      this.activeGroup = key;
     },
     logout() {
       doLogout();
@@ -1521,11 +1747,71 @@ export default {
 .settings-page {
   display: flex;
   justify-content: center;
+  align-items: flex-start;
+  gap: 24px;
   margin-top: 32px;
 }
+
+// 分组导航：跟随 <main> 滚动容器做 sticky。30+ 项平铺时它是唯一的
+// 「还能扫得动」的抓手。
+.settings-nav {
+  position: sticky;
+  // main 顶部 padding 是 64px（被 Navbar 占着），再留 12px 呼吸
+  top: 76px;
+  flex-shrink: 0;
+  width: 128px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 24px;
+  padding: 8px 0;
+
+  .nav-item {
+    border: none;
+    background: transparent;
+    text-align: left;
+    padding: 7px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--color-secondary);
+    cursor: pointer;
+    transition: color 0.2s, background-color 0.2s;
+
+    &:hover {
+      color: var(--color-text);
+      background: var(--color-secondary-bg-for-transparent);
+    }
+
+    &.active {
+      color: var(--color-text);
+      background: var(--color-primary-bg-for-transparent);
+      font-weight: 600;
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--color-primary);
+      outline-offset: 1px;
+    }
+  }
+}
+
+// 锚点本身不占高度，只负责把分组位置暴露给 scrollIntoView
+.settings-anchor {
+  height: 0;
+  scroll-margin-top: 80px;
+}
+
+@media (max-width: 1080px) {
+  .settings-nav {
+    display: none;
+  }
+}
+
 .container {
   margin-top: 24px;
   width: 720px;
+  min-width: 0;
 }
 h2 {
   margin-top: 48px;
@@ -1633,6 +1919,56 @@ h3 {
     font-size: 14px;
     margin-top: 0.5em;
     opacity: 0.7;
+  }
+
+  .subtitle {
+    font-size: 12px;
+    margin-top: 4px;
+    opacity: 0.62;
+  }
+
+  .device-notice {
+    color: var(--color-primary);
+    opacity: 0.9;
+    max-width: 280px;
+    line-height: 1.5;
+  }
+
+  .device-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .refresh-devices {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    padding: 0;
+    border: none;
+    border-radius: 8px;
+    font-size: 16px;
+    line-height: 1;
+    color: var(--color-text);
+    background: var(--color-secondary-bg);
+    cursor: pointer;
+    transition: background-color 0.2s;
+
+    &:hover {
+      background: var(--color-primary-bg);
+    }
+  }
+}
+
+// 需要纵向展开的配置项（比如律动效果那一整块）
+.item-expanded {
+  align-items: flex-start;
+  margin-top: -8px;
+
+  .right-expanded {
+    flex: 1;
+    min-width: 0;
+    margin-left: 32px;
   }
 }
 

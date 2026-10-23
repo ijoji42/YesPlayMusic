@@ -1,8 +1,36 @@
 # YesPlayMusic 后续版本路线图
 
 **日期**：2026-10-24
-**当前版本**：v0.4.11（已完成一轮优化，构建与 lint 通过）
+**当前版本**：v0.5.0
 **定位**：个人维护的 fork，业余时间推进，因此每个版本都按「一个周末能收尾」为粒度切分
+
+---
+
+## 实施进度（v0.5.0 已落地）
+
+本文档最初是一份「未来计划」。v0.5.0 已经把 v0.4.12 与 v0.5.0 两个版本的内容全部实现，
+下面的表格保留原始判断（为什么做、预期收益），并在状态列标注实际结果。
+
+| 项目 | 状态 | 实际结果 |
+|---|---|---|
+| 自动化测试 | ✅ 完成 | 27 条用例，`npm run test:unit` 通过（约 85ms）。**未用 Vitest**——见下方说明 |
+| CI | ✅ 完成 | `.github/workflows/ci.yml`：lint + test + build |
+| 冒烟清单 | ✅ 完成 | `docs/smoke-test.md` |
+| 移除 1024 图标 | ✅ 完成 | 产物再小 0.38 MB |
+| 设置页死代码清理 | ✅ 完成 | 删掉注释掉的音质标题、无用的 `withoutAudioPriviledge` 赋值 |
+| 首屏「继续收听」 | ✅ 完成 | `src/utils/listenHistory.js` + `ContinueListening.vue` |
+| 无缝播放补完 | ✅ 完成 | 单槽预载 + 交叉淡入淡出 + 加载态 |
+| Cmd/Ctrl+K 命令面板 | ✅ 完成 | `src/components/CommandPalette.vue` |
+| 设置页分组导航 | ✅ 完成 | sticky 锚点导航，8 个分组 |
+| 列表虚拟滚动 | ✅ 完成 | 点赞查询改 Set 索引（真正的热点）；单列长列表窗口化 |
+| 歌词背景律动 | ✅ 完成 | `src/utils/audioAnalyser.js` + `ReactivePreview.vue` + `SettingsReactive.vue` |
+
+**关于测试框架的偏离**：原计划用 Vitest，实际改为「esbuild + node:assert」自建跑器
+（`tests/run.js`，约 240 行）。原因是这台机器上的 `node_modules` 曾被 Windows 删除语义
+破坏过一次（约 3000 个文件需要手工还原），为了引入一个测试框架而冒「依赖树再次损坏、
+构建彻底跑不起来」的风险，收益不划算。esbuild 本来就在依赖里，跑器零新依赖、离线可用。
+用例覆盖的是真正会回归的纯逻辑：歌词解析、时间格式化、URL 白名单、默认配置契约、
+律动映射与节拍检测。
 
 ---
 

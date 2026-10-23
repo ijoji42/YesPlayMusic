@@ -310,28 +310,30 @@ export function initIpcMain(win, store, trayEventEmitter) {
   });
 
   ipcMain.on('playDiscordPresence', (event, track) => {
-    discordClient && discordClient.updatePresence({
-      details: track.name + ' - ' + track.ar.map(ar => ar.name).join(','),
-      state: track.al.name,
-      endTimestamp: Date.now() + track.dt,
-      largeImageKey: track.al.picUrl,
-      largeImageText: 'Listening ' + track.name,
-      smallImageKey: 'play',
-      smallImageText: 'Playing',
-      instance: true,
-    });
+    discordClient &&
+      discordClient.updatePresence({
+        details: track.name + ' - ' + track.ar.map(ar => ar.name).join(','),
+        state: track.al.name,
+        endTimestamp: Date.now() + track.dt,
+        largeImageKey: track.al.picUrl,
+        largeImageText: 'Listening ' + track.name,
+        smallImageKey: 'play',
+        smallImageText: 'Playing',
+        instance: true,
+      });
   });
 
   ipcMain.on('pauseDiscordPresence', (event, track) => {
-    discordClient && discordClient.updatePresence({
-      details: track.name + ' - ' + track.ar.map(ar => ar.name).join(','),
-      state: track.al.name,
-      largeImageKey: track.al.picUrl,
-      largeImageText: 'YesPlayMusic',
-      smallImageKey: 'pause',
-      smallImageText: 'Pause',
-      instance: true,
-    });
+    discordClient &&
+      discordClient.updatePresence({
+        details: track.name + ' - ' + track.ar.map(ar => ar.name).join(','),
+        state: track.al.name,
+        largeImageKey: track.al.picUrl,
+        largeImageText: 'YesPlayMusic',
+        smallImageKey: 'pause',
+        smallImageText: 'Pause',
+        instance: true,
+      });
   });
 
   ipcMain.on('setProxy', (event, config) => {
