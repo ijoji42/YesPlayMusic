@@ -72,6 +72,7 @@ jobs:
           path: dist
           if-no-files-found: ignore
           retention-days: 7
+
 # Deliberately NOT in this workflow: `npm run electron:build*`.
 # The Electron installer needs platform-specific binaries (dmg / nsis / AppImage
 # / snapcraft / rpm) and takes tens of minutes per OS. That path already lives
