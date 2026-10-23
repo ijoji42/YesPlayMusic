@@ -44,6 +44,15 @@ if (typeof globalThis.localStorage === 'undefined') {
   globalThis.localStorage = createStorage();
 }
 
+// Modules under test log through console.debug at import time
+// (`[debug][initLocalStorage.js]`). Those lines would interleave with the
+// runner's `ok N - ...` output and break TAP parsing, so mute that one level.
+// console.warn / console.error are left alone on purpose.
+if (!globalThis.__YPM_DEBUG_MUTED__) {
+  console.debug = () => {};
+  globalThis.__YPM_DEBUG_MUTED__ = true;
+}
+
 if (typeof globalThis.sessionStorage === 'undefined') {
   globalThis.sessionStorage = createStorage();
 }
