@@ -434,23 +434,25 @@ button {
 }
 
 .track.playing {
+  // 深色下 --color-primary-bg 是深蓝底、--color-primary 是蓝字，蓝底蓝字看不清；
+  // 前景统一走 --color-primary-bg-fg（浅色 = 主色，深色 = 正文色）。
   background: var(--color-primary-bg);
-  color: var(--color-primary);
+  color: var(--color-primary-bg-fg);
   .title,
   .album,
   .time,
   .title-and-artist .sub-title {
-    color: var(--color-primary);
+    color: var(--color-primary-bg-fg);
   }
   .title .featured,
   .artist,
   .explicit-symbol,
   .count {
-    color: var(--color-primary);
+    color: var(--color-primary-bg-fg);
     opacity: 0.88;
   }
   .no span {
-    color: var(--color-primary);
+    color: var(--color-primary-bg-fg);
     opacity: 0.78;
   }
 }

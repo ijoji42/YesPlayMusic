@@ -57,6 +57,10 @@ const PERSISTED_KEYS = [
   '_playNextList',
   '_personalFMTrack',
   '_personalFMNextTrack',
+  // 当前实例是不是 Web Audio 模式（原始值）。恢复会话时先按快照占位，
+  // 真正的实例建好后会被 _playAudioSource 覆盖成实际值。
+  // _currentSource 刻意不在这里：它是 blob URL，跨会话必然失效。
+  '_howlerWebAudio',
 ];
 
 /**
@@ -78,6 +82,36 @@ const delay = ms =>
       resolve('');
     }, ms);
   });
+
+// 用户是否指定了非默认输出设备。'default' 和空值都表示「系统默认」。
+function hasCustomOutputDevice() {
+  const device = store.state.settings?.outputDevice;
+  return Boolean(device) && device !== 'default';
+}
+
+/**
+ * 律动背景需要音频真正流过 Web Audio 图，AnalyserNode 才能读到频谱。
+ *
+ * Howler 的 html5 模式把播放交给 <audio> 元素直接输出到硬件，信号不经过
+ * Howler.masterGain，挂在 masterGain 上的 analyser 读到的永远是全 0，
+ * 界面上就是「当前音源无法读取频谱，背景已降级为静态效果」。
+ *
+ * 但也**不能**无条件关掉 html5：Web Audio 模式会把整首歌解码成 PCM 常驻内存
+ * （一首 4 分钟的 FLAC 约 80~130MB）。律动是默认不启用的功能，只有它真的被
+ * 选中时才值得付这份内存代价。
+ *
+ * 还有一层设备约束：Web Audio 模式下 `_sounds[0]._node` 是音频节点而不是
+ * <audio>，没有 setSinkId，而 Electron 13 的 Chromium 91 里 AudioContext
+ * 也还没有 setSinkId —— 一旦切到 Web Audio，用户选的输出设备就会静默失效。
+ * 设备路由是硬功能、律动是装饰，所以有自定义输出设备时优先保住设备，
+ * 让律动退回静态（设置面板里有对应提示和「切回系统默认」按钮）。
+ */
+function needsWebAudioAnalysis() {
+  return (
+    store.state.settings?.lyricsBackground === 'reactive' &&
+    !hasCustomOutputDevice()
+  );
+}
 
 function setTitle(track) {
   document.title = track
@@ -116,6 +150,43 @@ export default class {
     this._loadingNext = false; // 是否正在为下一首等待音源（驱动播放按钮的加载态）
     this._loadingTimer = null; // 加载态的兜底计时器
     this._playWatchdog = null; // 预载实例提升后的起播看门狗
+    this._outputDeviceSyncTimer = null; // 换输出设备时的防抖计时器
+    Object.defineProperty(this, '_outputDeviceSyncTimer', {
+      enumerable: false,
+    });
+    this._currentSource = null; // 当前音源字符串，升级到 Web Audio 模式时重建要用
+    this._howlerWebAudio = false; // 当前实例是否走 Web Audio 模式（可被 analyser 读取）
+    this._analyserRebuild = null; // 升级中的 Promise，用于挡住并发调用
+    // 并发锁没有任何视图依赖它，没必要让 Vue 把它变成响应式对象
+    Object.defineProperty(this, '_analyserRebuild', {
+      enumerable: false,
+    });
+
+    // 切到律动：允许升级，当前这首立刻生效。
+    // 反方向（律动关掉）由 syncAudioMode 内部的「降级需授权」挡掉。
+    store.watch(
+      state => state.settings?.lyricsBackground,
+      () => {
+        this.syncAudioMode(false);
+      }
+    );
+
+    // 换输出设备：模式可能双向变化，所以允许降级。
+    // 250ms 防抖有两个作用：一是把设备列表里的连点合并成一次重建，
+    // 二是避开 syncAudioMode 的单槽锁——升级要等解码（0.3~2s），
+    // 途中再来的请求会被锁直接吞掉，最终实例会停在错误的音频模式上。
+    store.watch(
+      state => state.settings?.outputDevice,
+      () => {
+        if (this._outputDeviceSyncTimer !== null) {
+          clearTimeout(this._outputDeviceSyncTimer);
+        }
+        this._outputDeviceSyncTimer = setTimeout(() => {
+          this._outputDeviceSyncTimer = null;
+          this.syncAudioMode(true);
+        }, 250);
+      }
+    );
 
     // 播放信息
     this._list = []; // 播放列表
@@ -482,17 +553,27 @@ export default class {
   _playAudioSource(source, autoplay = true, preloadedHowl = null) {
     const previous = this._howler;
     const crossfade = this._getCrossfadeDuration();
+    // 只有律动开启时才值得把整首歌解码进内存，其余场景继续用 html5 省内存
+    const useWebAudio = needsWebAudioAnalysis();
 
     let howl = preloadedHowl;
     if (!howl) {
       howl = new Howl({
         src: [source],
-        html5: true,
+        html5: !useWebAudio,
         preload: true,
         format: ['mp3', 'flac'],
       });
+      // 标记实例的音频模式，供 syncAudioMode() 判断要不要重建。
+      // 它挂在 Howl 实例上，而 Howl 实例从不参与序列化，所以不必担心落盘。
+      howl._ypmWebAudio = useWebAudio;
     }
     this._howler = howl;
+    // 重建实例（升级 Web Audio 模式 / 音源失效重取）都要靠这两个字段还原现场
+    this._currentSource = source;
+    this._howlerWebAudio = preloadedHowl
+      ? Boolean(preloadedHowl._ypmWebAudio)
+      : useWebAudio;
     this._bindHowlEvents(howl);
 
     // 交叉淡化：旧实例淡出后单独卸载。
@@ -538,6 +619,112 @@ export default class {
     this.setOutputDevice();
     // 起播之后再预载下一首，避免抢走当前曲目自己的带宽
     this._schedulePreload();
+  }
+  /**
+   * 让当前实例的音频模式与设置保持一致。
+   *
+   * 两个方向触发条件不同：
+   * - 升级（html5 → Web Audio）由「切到律动」触发，任何时候都允许；
+   * - 降级（Web Audio → html5）默认**不允许**：那会让正在播的歌重新解码一次、
+   *   中途断音，而省下来的内存对已经开始的这次播放没有意义。
+   *   唯一的例外是用户换了输出设备——设备路由只有 html5 的 <audio> 支持
+   *   （见 needsWebAudioAnalysis），此时宁可断一下也必须重建，否则用户
+   *   会以为设备选择失效了。这种场景由调用方传 allowDowngrade = true。
+   *
+   * 注意：选了非默认输出设备时 needsWebAudioAnalysis() 恒为 false，
+   * 所以此时本方法的目标模式就是 html5。
+   *
+   * @param {boolean} allowDowngrade 是否允许从 Web Audio 退回 html5
+   * @returns {Promise<boolean>} 是否已处于目标模式
+   */
+  syncAudioMode(allowDowngrade = false) {
+    const wantWebAudio = needsWebAudioAnalysis();
+    if (!this._currentTrack || !this._currentSource || !this._howler) {
+      return Promise.resolve(false);
+    }
+    if (this._howlerWebAudio === wantWebAudio) return Promise.resolve(true);
+    // 降级需要显式授权
+    if (!wantWebAudio && !allowDowngrade) return Promise.resolve(false);
+    // 重入保护：设置页连点、watch 与起播同时触发时只重建一次
+    if (this._analyserRebuild) return this._analyserRebuild;
+
+    const previous = this._howler;
+    let wasPlaying = false;
+    let position = 0;
+    try {
+      wasPlaying = previous.playing();
+      position = previous.seek() || 0;
+    } catch (e) {
+      // 取不到现场就当作从头暂停状态重建，至少比停在原地好
+      wasPlaying = false;
+      position = 0;
+    }
+
+    this._analyserRebuild = new Promise(resolve => {
+      let settled = false;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+
+      try {
+        // autoplay 传 false：解码期间不出声，就绪后再按原状态恢复，
+        // 否则用户会听到「先从头响一下、再跳回去」。
+        this._playAudioSource(this._currentSource, false);
+      } catch (e) {
+        finish(false);
+        return;
+      }
+
+      const howl = this._howler;
+      if (!howl) {
+        finish(false);
+        return;
+      }
+
+      const resume = () => {
+        if (this._howler !== howl) {
+          finish(false);
+          return;
+        }
+        try {
+          if (position > 0) howl.seek(position);
+        } catch (e) {
+          /* seek 失败就从头开始，不值得中断升级 */
+        }
+        if (wasPlaying) {
+          try {
+            this.play();
+          } catch (e) {
+            /* ignore */
+          }
+        }
+        finish(true);
+      };
+
+      if (howl.state() === 'loaded') {
+        resume();
+      } else {
+        howl.once('load', resume);
+      }
+      // 兜底：音源加载失败时不能让这个 Promise 永远挂着，否则后续调用
+      // 会被重入保护挡住，律动再也升不上去。
+      howl.once('loaderror', () => finish(false));
+    }).then(
+      value => {
+        this._analyserRebuild = null;
+        return value;
+      },
+      () => {
+        // 理论上不会走到这里；但一旦 reject 而不清锁，后续所有调用都会被
+        // 重入保护挡掉，律动就永久升不上去了。
+        this._analyserRebuild = null;
+        return false;
+      }
+    );
+
+    return this._analyserRebuild;
   }
   _bindHowlEvents(howl) {
     if (!howl || howl._ypmBound) return;
@@ -964,6 +1151,12 @@ export default class {
     const slot = this._preload;
     if (!slot) return null;
     if (slot.trackID !== trackID) return null;
+    // 用户刚把背景切成律动时，槽位里可能还是一个 html5 实例。提升它上来
+    // 依然读不到频谱（界面上就是「律动又没了」），所以宁可退回慢路径重取。
+    if (Boolean(slot.howl?._ypmWebAudio) !== needsWebAudioAnalysis()) {
+      this._invalidatePreload();
+      return null;
+    }
     if (Date.now() - slot.createdAt > PRELOAD_MAX_AGE) {
       this._invalidatePreload();
       return null;
@@ -982,8 +1175,12 @@ export default class {
     }
 
     const slot = this._preload;
+    // 音频模式变了（用户开关律动）就作废旧槽位，按新模式重新预载
+    const modeMatches =
+      slot && Boolean(slot.howl?._ypmWebAudio) === needsWebAudioAnalysis();
     if (
       slot &&
+      modeMatches &&
       slot.trackID === targetID &&
       Date.now() - slot.createdAt < PRELOAD_MAX_AGE
     ) {
@@ -1004,12 +1201,16 @@ export default class {
           // 走的是和正常播放完全相同的音源获取路径：
           // 优先命中 src/utils/db.js 的缓存并生成 Blob URL，
           // 所以预载既不会绕过缓存，也不会额外多下一遍音频。
+          const useWebAudio = needsWebAudioAnalysis();
           const howl = new Howl({
             src: [source],
-            html5: true,
+            html5: !useWebAudio,
             preload: true,
             format: ['mp3', 'flac'],
           });
+          // 预载实例的模式必须和提升时一致：律动开着却提升一个 html5 实例，
+          // analyser 依然读不到频谱，等于白升级一次。
+          howl._ypmWebAudio = useWebAudio;
           // 预载实例不出声：音量跟随用户设置，真正提升时再按需从 0 淡入
           howl.volume(this.volume);
 

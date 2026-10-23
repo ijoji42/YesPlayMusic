@@ -1788,11 +1788,6 @@ export default {
       background: var(--color-primary-bg-for-transparent);
       font-weight: 600;
     }
-
-    &:focus-visible {
-      outline: 2px solid var(--color-primary);
-      outline-offset: 1px;
-    }
   }
 }
 
@@ -1890,8 +1885,9 @@ h3 {
       }
       &:hover {
         opacity: 1;
-        background: #eaeffd;
-        color: #335eea;
+        // 原来写死浅色模式的 #eaeffd / #335eea，深色下会变成一块亮蓝底
+        background: var(--color-primary-bg);
+        color: var(--color-primary-bg-fg);
       }
       &:active {
         opacity: 1;
@@ -1972,21 +1968,12 @@ h3 {
   }
 }
 
+// 外观（背景、圆角、箭头、聚焦态）统一由 global.scss 的 select 规则提供，
+// 这里只保留设置页自己的排版：宽度约束与字重。
 select {
   min-width: 192px;
   max-width: 600px;
   font-weight: 600;
-  border: none;
-  padding: 8px 12px 8px 12px;
-  border-radius: 8px;
-  color: var(--color-text);
-  background: var(--color-secondary-bg);
-  appearance: none;
-  &:focus {
-    outline: none;
-    color: var(--color-primary);
-    background: var(--color-primary-bg);
-  }
 }
 
 button {
@@ -2071,7 +2058,7 @@ input[type='number'] {
     min-height: 34px;
     box-sizing: border-box;
     &.active {
-      color: var(--color-primary);
+      color: var(--color-primary-bg-fg);
       background-color: var(--color-primary-bg);
     }
   }

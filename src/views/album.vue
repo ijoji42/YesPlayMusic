@@ -55,7 +55,9 @@
             :icon-button="true"
             :horizontal-padding="0"
             :color="dynamicDetail.isSub ? 'blue' : 'grey'"
-            :text-color="dynamicDetail.isSub ? '#335eea' : ''"
+            :text-color="
+              dynamicDetail.isSub ? 'var(--color-primary-bg-fg)' : ''
+            "
             :background-color="
               dynamicDetail.isSub ? 'var(--color-secondary-bg)' : ''
             "

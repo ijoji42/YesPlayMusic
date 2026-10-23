@@ -84,8 +84,36 @@
       </div>
     </div>
 
-    <p v-if="reducedMotion" class="notice">
-      {{ $t('settings.lyricsReactive.reducedMotion') }}
+    <!-- 系统偏好只作为「建议」：用户点一下主行动就视为显式同意，
+         所以 override 之后这条提示不再出现，避免反复打扰。 -->
+    <p v-if="reducedMotion && !overridden" class="notice">
+      <span class="notice-text">{{
+        $t('settings.lyricsReactive.reducedMotion')
+      }}</span>
+      <button
+        type="button"
+        class="notice-action"
+        @click="overrideReducedMotion"
+      >
+        {{ $t('settings.lyricsReactive.reducedMotionAction') }}
+      </button>
+    </p>
+
+    <!-- 律动要读频谱就必须走 Web Audio 图，而 Web Audio 会绕过 <audio> 的
+         setSinkId（Electron 13 的 Chromium 91 里 AudioContext 还没有 setSinkId），
+         用户指定的输出设备会失效。设备路由是硬功能、律动是装饰，所以这种
+         情况下优先保住设备，并在这里给一条可点的回退路径。 -->
+    <p v-if="outputDeviceBlocksReactive" class="notice">
+      <span class="notice-text">{{
+        $t('settings.lyricsReactive.outputDeviceBlocked')
+      }}</span>
+      <button
+        type="button"
+        class="notice-action"
+        @click="useSystemOutputDevice"
+      >
+        {{ $t('settings.lyricsReactive.useSystemOutputDevice') }}
+      </button>
     </p>
   </div>
 </template>
@@ -102,7 +130,9 @@ import {
 } from '@/utils/audioAnalyser';
 
 const PRESET_NAMES = ['soft', 'punchy', 'beatOnly', 'breathe'];
-const DIMENSION_KEYS = ['scale', 'blur', 'brightness', 'hue', 'saturate'];
+// 与 audioAnalyser 的 DIMENSION_KEYS 保持同一顺序；色相旋转已整链路移除，
+// 由「视差漂移」顶替（旋转色相会把封面转成用户说的「杀马特」配色）。
+const DIMENSION_KEYS = ['scale', 'blur', 'brightness', 'saturate', 'drift'];
 
 export default {
   name: 'SettingsReactive',
@@ -129,6 +159,15 @@ export default {
     },
     coverUrl() {
       return this.player.currentTrack?.al?.picUrl || '';
+    },
+    // 用户是否已经显式同意「即使系统减弱动效也要开启律动」
+    overridden() {
+      return Boolean(this.settings.lyricsReactiveOverride);
+    },
+    // 选了具体输出设备时，律动无法同时生效（见模板里的注释）
+    outputDeviceBlocksReactive() {
+      const device = this.settings.outputDevice;
+      return Boolean(device) && device !== 'default';
     },
   },
   created() {
@@ -191,6 +230,26 @@ export default {
         }),
       });
     },
+    // 用户显式确认后，把「减弱动态效果」这条系统偏好降级为建议而不是强制，
+    // 同时确保歌词背景已经切到律动，点一下就能看到效果。
+    overrideReducedMotion() {
+      this.$store.commit('updateSettings', {
+        key: 'lyricsReactiveOverride',
+        value: true,
+      });
+      if (this.settings.lyricsBackground !== 'reactive') {
+        this.$store.commit('updateSettings', {
+          key: 'lyricsBackground',
+          value: 'reactive',
+        });
+      }
+    },
+    // 切回系统默认设备，让律动重新可用。提交后必须手动通知播放器重设 sink，
+    // 否则要等下一次起播才生效。
+    useSystemOutputDevice() {
+      this.$store.commit('changeOutputDevice', 'default');
+      this.player.setOutputDevice();
+    },
   },
 };
 </script>
@@ -247,7 +306,8 @@ export default {
 
     &.active {
       background: var(--color-primary);
-      color: #fff;
+      // 深色主题下 #fff 会和浅色主色打架，用页面底色反相更稳
+      color: var(--color-body-bg);
     }
   }
 
@@ -272,14 +332,10 @@ export default {
     align-items: start;
   }
 
-  select {
+  // select 的外观（appearance、自定义箭头、color-scheme）统一由 global.scss
+  // 接管，这里只保证它撑满 .band 这一列，避免删掉本地样式后宽度塌掉。
+  .band select {
     width: 100%;
-    padding: 6px 10px;
-    border: none;
-    border-radius: 8px;
-    font-size: 13px;
-    color: var(--color-text);
-    background: var(--color-secondary-bg-for-transparent);
   }
 
   .checks {
@@ -313,13 +369,19 @@ export default {
       background: var(--color-primary-bg-for-transparent);
     }
 
+    // 键盘聚焦用中性描边；蓝色焦点框在深色下太跳，已被全站下线
     &:focus-within {
-      outline: 2px solid var(--color-primary);
+      outline: 1px solid var(--color-secondary);
       outline-offset: 2px;
     }
   }
 
   .notice {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
     margin: 16px 0 0;
     padding: 8px 12px;
     border-radius: 8px;
@@ -327,6 +389,27 @@ export default {
     line-height: 18px;
     color: var(--color-text);
     background: var(--color-primary-bg-for-transparent);
+  }
+
+  .notice-text {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .notice-action {
+    padding: 5px 14px;
+    border: none;
+    border-radius: 999px;
+    font-size: 12px;
+    white-space: nowrap;
+    cursor: pointer;
+    color: var(--color-text);
+    background: var(--color-secondary-bg-for-transparent);
+    transition: background-color 0.2s;
+
+    &:hover {
+      background: var(--color-primary-bg-for-transparent);
+    }
   }
 }
 
@@ -347,7 +430,8 @@ export default {
 
 @media (prefers-reduced-motion: reduce) {
   .reactive-settings .preset,
-  .reactive-settings .check {
+  .reactive-settings .check,
+  .reactive-settings .notice-action {
     transition: none;
   }
 }

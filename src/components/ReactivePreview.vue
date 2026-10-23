@@ -220,13 +220,48 @@ export default {
     left: -25%;
     background-size: cover;
     background-position: center;
-    // 模糊半径由 --react-blur 提供，这里只做等比缩小
+    // 模糊半径由 --react-blur 提供，这里只做等比缩小。
+    // 与歌词页保持一致：去掉 hue-rotate，只留清晰度 / 明度 / 饱和度。
     filter: blur(calc(var(--react-blur, 50px) * 0.2))
-      brightness(var(--react-brightness, 1)) saturate(var(--react-saturate, 1))
-      hue-rotate(var(--react-hue, 0deg));
-    transform: scale(var(--react-scale, 1));
-    transition: transform 80ms linear, filter 80ms linear;
+      brightness(var(--react-brightness, 1)) saturate(var(--react-saturate, 1));
+    // 叠加视差：方向与歌词页近层一致（左上），幅度减半。
+    // 位移必须和 blur 一样乘 0.2 做等比缩放：drift 是绝对像素值（上限 22px），
+    // 直接用在 240px 的块上会变成 9% 的位移，而歌词页 1400px 视口下只有 1.6%，
+    // 预览会把动感夸大约 6 倍，用户就会照着失真的预览去选预设。
+    transform: translate3d(
+        calc(var(--react-drift, 0px) * 0.2),
+        calc(var(--react-drift, 0px) * -0.1),
+        0
+      )
+      scale(var(--react-scale, 1));
+    transition: transform 140ms cubic-bezier(0.2, 0, 0, 1),
+      filter 160ms cubic-bezier(0.2, 0, 0, 1);
     will-change: transform, filter;
+
+    // 呼吸辉光：参数与歌词页一致（白色椭圆、随 --react-glow 明灭），
+    // 让用户在设置页看到的明暗节奏就是歌词页里真实的那个。
+    &::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: radial-gradient(
+        ellipse 60% 55% at 50% 52%,
+        rgba(255, 255, 255, 0.55),
+        rgba(255, 255, 255, 0) 72%
+      );
+      opacity: var(--react-glow, 0);
+      transition: opacity 140ms cubic-bezier(0.2, 0, 0, 1);
+    }
+  }
+
+  // 深色主题下压暗辉光，避免预览块中心发灰
+  [data-theme='dark'] & .stage::after {
+    background: radial-gradient(
+      ellipse 60% 55% at 50% 52%,
+      rgba(255, 255, 255, 0.28),
+      rgba(255, 255, 255, 0) 72%
+    );
   }
 
   .badge {
@@ -279,7 +314,8 @@ export default {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .reactive-preview .stage {
+  .reactive-preview .stage,
+  .reactive-preview .stage::after {
     transition: none;
   }
 

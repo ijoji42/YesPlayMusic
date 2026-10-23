@@ -477,7 +477,8 @@ h1 {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    color: var(--color-primary);
+    // 主色浅底上的前景：浅色下是主色字，深色下自动跟随正文色
+    color: var(--color-primary-bg-fg);
 
     .title {
       font-size: 24px;
@@ -502,7 +503,9 @@ h1 {
       cursor: default;
 
       .svg-icon {
-        color: var(--color-primary-bg);
+        // 主色实心圆上的图标：两套主题都用白色，原来的 --color-primary-bg
+        // 在深色下已变成半透明主色，压上去会看不见。
+        color: #fff;
         margin-left: 4px;
         height: 16px;
         width: 16px;
@@ -523,7 +526,7 @@ h1 {
     flex-wrap: wrap;
     font-size: 14px;
     opacity: 0.88;
-    color: var(--color-primary);
+    color: var(--color-primary-bg-fg);
     p {
       margin-top: 2px;
     }

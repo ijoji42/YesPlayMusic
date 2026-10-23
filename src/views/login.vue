@@ -84,7 +84,8 @@ export default {
   .svg-icon {
     height: 24px;
     width: 24px;
-    color: rgba(82, 82, 82, 0.28);
+    // 原来是写死的 28% 灰，深色下压到 #222 上等于看不见
+    color: var(--c-text-disabled);
   }
 }
 
@@ -100,7 +101,7 @@ export default {
   display: flex;
   justify-content: center;
   align-items: center;
-  background: #eaeffd;
+  background: var(--color-primary-bg);
   border-radius: 8px;
   height: 128px;
   width: 300px;
@@ -124,7 +125,7 @@ export default {
     // justify-content: space-around;
     align-items: center;
 
-    color: #335eea;
+    color: var(--color-primary-bg-fg);
   }
 
   .title-info {
@@ -138,7 +139,9 @@ export default {
   .info {
     margin-top: 2px;
     font-size: 14px;
-    color: rgba(51, 94, 234, 0.78);
+    // 原来写死 78% 的主色，深色下主色底变深蓝后文字会糊掉；跟随主色底的前景色
+    color: var(--color-primary-bg-fg);
+    opacity: 0.78;
   }
   .svg-icon {
     opacity: 0;

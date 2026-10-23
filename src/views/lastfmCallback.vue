@@ -81,7 +81,7 @@ button {
   font-size: 16px;
   font-weight: 600;
   background-color: var(--color-primary-bg);
-  color: var(--color-primary);
+  color: var(--color-primary-bg-fg);
   border-radius: 8px;
   margin-top: 24px;
   transition: 0.2s;

@@ -53,19 +53,25 @@
   --color-primary-bg-for-transparent: rgba(189, 207, 255, 0.28);
   --color-secondary-bg-for-transparent: rgba(209, 209, 214, 0.28);
   --html-overflow-y: overlay;
+  --select-chevron: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 9 6'%3E%3Cpath fill='%237a7a7b' d='M0 0h9L4.5 6z'/%3E%3C/svg%3E");
 }
 
 [data-theme='dark'] {
   --color-body-bg: #222222;
   --color-text: #ffffff;
   --color-primary: #335eea;
-  --color-primary-bg: #bbcdff;
+  /* 深色下原来的 #bbcdff 是接近白的浅蓝，被当作背景用时（播放中的歌曲行、
+     双色按钮、筛选标签）会在深色界面里拉出一条条刺眼的亮带，而且上面压的
+     --color-primary 蓝字与亮底几乎同色。改成低透明主色，保留「被选中」的语义。 */
+  --color-primary-bg: rgba(51, 94, 234, 0.28);
+  --color-primary-bg-fg: var(--color-text);
   --color-primary-gradient: var(--color-primary);
   --color-secondary: #7a7a7b;
   --color-secondary-bg: #323232;
   --color-navbar-bg: rgba(34, 34, 34, 0.86);
   --color-primary-bg-for-transparent: rgba(255, 255, 255, 0.12);
   --color-secondary-bg-for-transparent: rgba(255, 255, 255, 0.08);
+  --select-chevron: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 9 6'%3E%3Cpath fill='%23b0b0b2' d='M0 0h9L4.5 6z'/%3E%3C/svg%3E");
 }
 
 #app,
@@ -77,6 +83,16 @@ input {
 }
 body {
   background-color: var(--color-body-bg);
+  // 原项目只设了背景色、没设文字色，深色下凡是没显式写 color 的按钮/图标
+  // 都会退回浏览器默认黑，在 #222 上就是用户说的「黑色的按钮」。
+  // 在这里补一个继承源，未指定的控件自动跟正文同色（浅色仍是 #000，无变化）。
+  color: var(--color-text);
+  // 落在 --color-primary-bg 这块「主色浅底」上的前景色。浅色下用主色字，
+  // 深色下浅底不存在了（见上），直接跟随正文色。
+  // 必须声明在 body 而不是 :root：--color-primary 由 changeThemeColor() 以
+  // 内联样式写在 body 上（换肤），写在 :root 会在 html 层就把 var() 求值完，
+  // 拿不到 body 的换肤值。
+  --color-primary-bg-fg: var(--color-primary);
 }
 
 html {
@@ -95,25 +111,68 @@ button {
   cursor: pointer;
   user-select: none;
 }
-// 键盘可达性：原实现把所有 input / button 的焦点轮廓直接抹掉，
-// 键盘用户完全看不到焦点在哪。现在鼠标点击不出环、键盘导航出环。
-input,
-button {
-  &:focus {
-    outline: none;
-  }
+// 焦点策略：鼠标点击不出任何轮廓，只有键盘导航才给一条极细的中性提示线。
+// 原来这里用 --color-primary(#335eea) 画双环，鼠标点按钮时也会出现一圈蓝框，
+// 和整体审美冲突；换成 --color-secondary 的 1px 细线后基本不打扰视觉。
+:focus {
+  outline: none;
 }
 :focus-visible {
-  outline: 2px solid var(--color-primary);
+  outline: 1px solid var(--color-secondary);
   outline-offset: 2px;
 }
-// 主色背景或毛玻璃上 outline 会和背景糊在一起，用双环兜底
-button:focus-visible,
-a:focus-visible,
-[tabindex]:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px var(--color-body-bg), 0 0 0 4px var(--color-primary);
+// 触屏/鼠标点击不残留高亮块
+button,
+a,
+[tabindex],
+summary {
+  -webkit-tap-highlight-color: transparent;
 }
+
+/* ---------------------------------------------------------------
+   select：全站统一外观。
+   原生 select 的弹出层由系统绘制，只靠 CSS 改不干净，所以同时声明
+   color-scheme 让 Chromium 用深色绘制原生控件（下拉列表、滚动条）。
+   --------------------------------------------------------------- */
+select {
+  color-scheme: light;
+  appearance: none;
+  -webkit-appearance: none;
+  /* 垂直 8px 与全站 button 的 8px 内边距对齐，避免同一行里下拉比按钮矮 4px；
+     右侧 28px 是留给自绘箭头的空间。 */
+  padding: 8px 28px 8px 10px;
+  border: none;
+  border-radius: var(--r-md, 8px);
+  font-family: inherit;
+  font-size: var(--fs-caption, 12px);
+  color: var(--color-text);
+  background-color: var(--color-secondary-bg-for-transparent);
+  background-image: var(--select-chevron);
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 9px 6px;
+  cursor: pointer;
+  transition: background-color var(--dur-2, 200ms) var(--ease-standard, ease);
+
+  &:hover {
+    background-color: var(--color-primary-bg-for-transparent);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+
+  option {
+    color: var(--color-text);
+    background-color: var(--color-body-bg);
+  }
+}
+
+[data-theme='dark'] select {
+  color-scheme: dark;
+}
+
 a {
   color: inherit;
   text-decoration: none;

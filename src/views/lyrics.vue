@@ -316,6 +316,13 @@ const electron =
   process.env.IS_ELECTRON === true ? window.require('electron') : null;
 const ipcRenderer = electron?.ipcRenderer || null;
 
+// 系统级「减弱动态效果」。放在模块作用域而不是 data 里：它不需要触发重渲染，
+// 而 shouldRunReactive 在播放/切歌/开关歌词页时本来就会被重新求值。
+function prefersReducedMotion() {
+  if (typeof window === 'undefined' || !window.matchMedia) return false;
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
 export default {
   name: 'Lyrics',
   components: {
@@ -456,12 +463,15 @@ export default {
     // 只有「律动模式 + 歌词页可见 + 正在播放 + 环境支持 Web Audio」
     // 四个条件同时成立时才跑 rAF 循环。关掉任何一个条件都会立刻停掉，
     // 这一点可以用 DevTools 的 Performance 面板验证。
+    // 系统开了「减弱动态效果」时默认不跑，除非用户在设置里显式点过「仍然开启」。
     shouldRunReactive() {
       return (
         this.settings.lyricsBackground === 'reactive' &&
         this.showLyrics === true &&
         this.player.playing === true &&
-        supportsReactive()
+        supportsReactive() &&
+        (!prefersReducedMotion() ||
+          Boolean(this.settings.lyricsReactiveOverride))
       );
     },
   },
@@ -581,8 +591,9 @@ export default {
         '--react-blur',
         '--react-brightness',
         '--react-saturate',
-        '--react-hue',
         '--react-pulse',
+        '--react-drift',
+        '--react-glow',
       ].forEach(key => stage.style.removeProperty(key));
     },
     applyReactiveFrame(frame) {
@@ -907,11 +918,18 @@ export default {
   --react-base-brightness: 1.5;
   --react-base-contrast: 0.75;
 
-  filter: blur(var(--react-blur, 50px))
-    contrast(calc(var(--react-base-contrast) * var(--react-contrast, 1)))
+  // 辉光层是 ::after，需要一个裁切边界，否则边缘的径向渐变会溢出到歌词文字上
+  overflow: hidden;
+
+  // 去掉了 hue-rotate：整片背景跟着能量整体换色，是最强的「廉价」信号，
+  // 也是用户说的「杀马特」感的来源。现在只保留清晰度 / 明度 / 饱和度三个维度。
+  // blur 随能量从 50px 收到 40px，读起来是镜头对焦，而不是画面被揉软。
+  filter: blur(var(--react-blur, 50px)) contrast(var(--react-base-contrast))
     brightness(calc(var(--react-base-brightness) * var(--react-brightness, 1)))
-    saturate(var(--react-saturate, 1)) hue-rotate(var(--react-hue, 0deg));
-  transition: filter 80ms linear;
+    saturate(var(--react-saturate, 1));
+  // 160ms + ease-out：原来 80ms linear 每帧都在「跳」，没有惯性。
+  // 慢一倍并让曲线头快尾缓，变化才是被推出去的，而不是硬切。
+  transition: filter 160ms cubic-bezier(0.2, 0, 0, 1);
   will-change: filter;
 }
 
@@ -920,15 +938,62 @@ export default {
   --react-base-contrast: 1.25;
 }
 
-.lyrics-background.reactive-background > div {
-  transform: scale(var(--react-scale, 1));
-  transition: transform 80ms linear;
+// 两层景深：近层（右上，压在歌词前面）跟着缩放 + 大幅漂移，
+// 远层（左下）只做反向的小幅漂移。两层位移方向和幅度都不同，
+// 眼睛读到的是「镜头在轻微推拉」，而不是整块背景一起被拉伸。
+// 近层才吃 --react-scale，远层不吃 —— 缩放差本身也构成景深。
+.lyrics-background.reactive-background > .top-right {
+  transform: translate3d(
+      calc(var(--react-drift, 0px) * -1),
+      calc(var(--react-drift, 0px) * -0.55),
+      0
+    )
+    scale(var(--react-scale, 1));
+  transition: transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
   will-change: transform;
+}
+
+.lyrics-background.reactive-background > .bottom-left {
+  transform: translate3d(
+    calc(var(--react-drift, 0px) * 0.7),
+    calc(var(--react-drift, 0px) * 0.45),
+    0
+  );
+  transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+// 呼吸辉光：中心一团极淡的白光，随 --react-glow 明灭。
+// 它只提亮画面中心，不换色也不位移，所以抢不走歌词的注意力；
+// 作用是把「音乐有能量」这件事从形变转移到光感上，这是质感的来源。
+.lyrics-background.reactive-background::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse 60% 55% at 50% 52%,
+    rgba(255, 255, 255, 0.55),
+    rgba(255, 255, 255, 0) 72%
+  );
+  opacity: var(--react-glow, 0);
+  transition: opacity 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+// 深色主题下背景本身已经很暗，白光要压到 0.28，否则中心会发灰、像蒙了层雾
+[data-theme='dark'] .lyrics-background.reactive-background::after {
+  background: radial-gradient(
+    ellipse 60% 55% at 50% 52%,
+    rgba(255, 255, 255, 0.28),
+    rgba(255, 255, 255, 0) 72%
+  );
 }
 
 @media (prefers-reduced-motion: reduce) {
   .lyrics-background.reactive-background,
-  .lyrics-background.reactive-background > div {
+  .lyrics-background.reactive-background > .top-right,
+  .lyrics-background.reactive-background > .bottom-left,
+  .lyrics-background.reactive-background::after {
     transition: none;
   }
 }

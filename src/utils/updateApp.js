@@ -27,6 +27,15 @@ const updateSetting = () => {
     settings.lyricsBackground = true;
   }
 
+  // 一次性迁移：歌词背景的默认效果从「静态渐变」改为「动态」。
+  // 用独立标记而不是版本号判断，避免用户升级路径不同导致迁移跑两次。
+  if (localStorage.getItem('ypm-lyrics-bg-dynamic') !== '1') {
+    if (settings.lyricsBackground === true) {
+      settings.lyricsBackground = 'dynamic';
+    }
+    localStorage.setItem('ypm-lyrics-bg-dynamic', '1');
+  }
+
   localStorage.setItem('settings', JSON.stringify(settings));
 };
 

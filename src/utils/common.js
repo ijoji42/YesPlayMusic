@@ -16,7 +16,10 @@ const themeColorPresets = {
       // 导航栏「当前页」高亮、播放器激活图标都属于不可读状态。
       // 提亮后实测 5.1:1，达到 WCAG AA。
       primary: '#6b8dff',
-      primaryBg: '#bbcdff',
+      // 原来是 #bbcdff（接近白的浅蓝），被当作「选中/播放中」底色用时会在
+      // 深色界面里拉出亮带，且与提亮后的主色字几乎同色。改成深色主色调，
+      // 与 sunset / ocean / forest 三个深色预设的做法对齐。
+      primaryBg: '#1e2a4d',
       primaryBgForTransparent: 'rgba(107, 141, 255, 0.24)',
       primaryGradient: '#335eea',
     },

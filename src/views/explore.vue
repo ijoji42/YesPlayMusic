@@ -238,12 +238,12 @@ h1 {
 
   &:hover {
     background-color: var(--color-primary-bg);
-    color: var(--color-primary);
+    color: var(--color-primary-bg-fg);
   }
 }
 .button.active {
   background-color: var(--color-primary-bg);
-  color: var(--color-primary);
+  color: var(--color-primary-bg-fg);
 }
 .panel {
   margin-top: 10px;
@@ -294,7 +294,7 @@ h1 {
       &:hover {
         opacity: 1;
         background-color: var(--color-primary-bg);
-        color: var(--color-primary);
+        color: var(--color-primary-bg-fg);
       }
     }
   }

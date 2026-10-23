@@ -1,11 +1,16 @@
 // 音频分析层：把 AnalyserNode 挂到 Howler 的主增益节点上，读取频段能量，
 // 并做节拍检测。供歌词页背景（lyrics.vue）和设置页预览（ReactivePreview.vue）共用。
 //
-// 三个必须守住的点：
-// 1. analyser 只从 masterGain 取信号，**绝不**再接 destination，否则声音会放两遍。
-// 2. 频谱读不到时（跨域音源 / 解码失败 / 上下文被挂起）必须能被上层识别出来，
+// 四个必须守住的点：
+// 1. **音源必须是 Web Audio 模式**。Howler 的 html5 模式把播放交给 <audio> 元素
+//    直接输出到硬件，信号根本不经过 Howler.masterGain；而 analyser 是挂在
+//    masterGain 上的旁路监听，所以在 html5 模式下 getByteFrequencyData() 永远是
+//    全 0，界面只会一直显示「无法读取频谱」。Player.syncAudioMode() 负责
+//    在律动被选中时把当前实例单向升级成 Web Audio 模式。
+// 2. analyser 只从 masterGain 取信号，**绝不**再接 destination，否则声音会放两遍。
+// 3. 频谱读不到时（跨域音源 / 解码失败 / 上下文被挂起）必须能被上层识别出来，
 //    降级成静态背景，而不是显示一个「假装在动」的背景。
-// 3. 整个模块不进 Vuex、不进组件 data。每帧只写 CSS 自定义属性，避免整页重渲染。
+// 4. 整个模块不进 Vuex、不进组件 data。每帧只写 CSS 自定义属性，避免整页重渲染。
 
 import { Howler } from 'howler';
 
@@ -23,58 +28,63 @@ const SILENT_FRAME_LIMIT = 60; // 连续 2 秒全 0 才认定「读不到频谱�
 const MIN_BEAT_LEVEL = 70; // 绝对门限，防止安静段落里的噪声被当成鼓点
 const PULSE_DECAY = 0.86; // 每帧衰减，半衰期约 0.15s
 const BASE_BLUR = 50; // 与 lyrics.vue 里 .lyrics-background 的 blur(50px) 对齐
+// 非对称包络的一阶系数：起音快、释放慢。
+// 对称的平滑会跟着每个鼓点一起抽搐；起音用 0.62 让「一下」立刻到位，
+// 释放用 0.13 让背景缓慢回落，观感上才像「呼吸」而不是「抖动」。
+const ATTACK = 0.62;
+const RELEASE = 0.13;
 
 export const REACTIVE_PRESETS = {
   soft: {
-    intensity: 40,
-    sensitivity: 50,
-    smoothing: 70,
+    intensity: 55,
+    sensitivity: 55,
+    smoothing: 78,
     band: 'bass',
     dimensions: {
       scale: true,
       blur: true,
-      brightness: false,
-      hue: false,
+      brightness: true,
       saturate: false,
+      drift: true,
     },
   },
   punchy: {
-    intensity: 85,
-    sensitivity: 65,
-    smoothing: 55,
+    intensity: 62,
+    sensitivity: 70,
+    smoothing: 48,
     band: 'all',
     dimensions: {
       scale: true,
       blur: true,
       brightness: true,
-      hue: true,
       saturate: true,
+      drift: true,
     },
   },
   beatOnly: {
-    intensity: 70,
-    sensitivity: 80,
-    smoothing: 30,
+    intensity: 52,
+    sensitivity: 82,
+    smoothing: 32,
     band: 'bass',
     dimensions: {
       scale: true,
       blur: false,
       brightness: false,
-      hue: false,
       saturate: false,
+      drift: false,
     },
   },
   breathe: {
-    intensity: 30,
-    sensitivity: 35,
-    smoothing: 90,
+    intensity: 26,
+    sensitivity: 34,
+    smoothing: 92,
     band: 'mid',
     dimensions: {
       scale: false,
       blur: true,
       brightness: true,
-      hue: false,
       saturate: false,
+      drift: true,
     },
   },
 };
@@ -84,7 +94,7 @@ export const DEFAULT_REACTIVE_CONFIG = Object.assign(
   REACTIVE_PRESETS.soft
 );
 
-const DIMENSION_KEYS = ['scale', 'blur', 'brightness', 'hue', 'saturate'];
+const DIMENSION_KEYS = ['scale', 'blur', 'brightness', 'saturate', 'drift'];
 const BANDS = ['bass', 'mid', 'treble', 'all'];
 
 function clamp(value, min, max) {
@@ -105,12 +115,18 @@ export function normalizeReactiveConfig(raw) {
   const src = raw && typeof raw === 'object' ? raw : {};
   const dims =
     src.dimensions && typeof src.dimensions === 'object' ? src.dimensions : {};
+  // 老版本用 dimensions.hue 控制 hue-rotate，这个维度已经整链路删除。
+  // 直接丢掉会让老用户「关掉色相」的偏好变成默认开启视差，所以用它来补 drift：
+  // 老配置 hue:false 迁移后就是「不视差」，观感与它原来「不换色」的克制程度一致。
+  const driftSource =
+    dims.drift === undefined && dims.hue !== undefined ? dims.hue : dims.drift;
   const dimensions = {};
   DIMENSION_KEYS.forEach(key => {
+    const value = key === 'drift' ? driftSource : dims[key];
     dimensions[key] =
-      dims[key] === undefined
+      value === undefined
         ? DEFAULT_REACTIVE_CONFIG.dimensions[key]
-        : Boolean(dims[key]);
+        : Boolean(value);
   });
   return {
     preset: typeof src.preset === 'string' ? src.preset : 'custom',
@@ -180,12 +196,16 @@ let beatDetector = null;
 let silentFrames = 0;
 let degraded = false;
 let pulse = 0;
+// 非对称包络后的归一化能量（0~1）。放在模块级而不是每帧局部变量，
+// 否则「释放慢」就没有跨帧记忆可言了。
+let smoothLevel = 0;
 let lastFrame = {
   bass: 0,
   mid: 0,
   treble: 0,
   energy: 0,
   level: 0,
+  smooth: 0,
   beat: false,
   pulse: 0,
   degraded: false,
@@ -242,6 +262,7 @@ export function releaseAnalyser() {
   silentFrames = 0;
   degraded = false;
   pulse = 0;
+  smoothLevel = 0;
 }
 
 /** 读取一次频段能量。读不到返回 null。 */
@@ -299,37 +320,61 @@ function pickLevel(bands, band) {
  * 纯函数：把一帧分析结果映射成 CSS 自定义属性。
  * 单独抽出来是为了可测（tests/ 里有对应用例），也方便设置页预览复用。
  *
- * 只输出会被 transform / filter 消费的属性，不碰 width / margin / top
+ * 变量契约（视觉层照此消费，名字和单位都不要改）：
+ *   --react-scale       1 ~ 1.052     无单位
+ *   --react-blur        50px ~ 30px   能量越高越清晰（聚焦感），不是越大越糊
+ *   --react-brightness  1 ~ 1.06      无单位
+ *   --react-saturate    1 ~ 1.10      无单位
+ *   --react-drift       0px ~ 26px    位移幅度，方向由 CSS 按层决定
+ *   --react-glow        0.06 ~ 0.32   辉光层 opacity。**地板是 0.06 而不是 0**：
+ *                                     律动开着时中心永远有一层极淡的白，CSS 侧
+ *                                     不能假设它能淡到全透明（深色主题下那层白
+ *                                     本身的 alpha 要压住，否则会像蒙雾）
+ *   --react-pulse       0 ~ 1         节拍脉冲
+ *
+ * 只输出会被 transform / filter / opacity 消费的属性，不碰 width / margin / top
  * 这类会触发重排的键。
  */
 export function mapFrameToVars(frame, cfg) {
   const c = normalizeReactiveConfig(cfg);
   const dims = c.dimensions;
-  const amp = clamp((frame && frame.level) / 255, 0, 1);
+  // 优先用非对称包络后的 smooth；没有时（外部只传了 level 的调用方、测试）
+  // 回退到瞬时能量，保证这个函数单独使用时行为仍然可预测。
+  const hasSmooth = frame && typeof frame.smooth === 'number';
+  const rawAmp = hasSmooth ? frame.smooth : ((frame && frame.level) || 0) / 255;
+  const amp = clamp(rawAmp, 0, 1);
   const power = c.intensity / 100;
   const pulseValue = clamp((frame && frame.pulse) || 0, 0, 1);
   const vars = {};
 
-  if (dims.scale) {
-    const scale = 1 + amp * power * 0.14 + pulseValue * power * 0.06;
-    vars['--react-scale'] = num(scale, 4);
-  } else {
-    vars['--react-scale'] = '1';
-  }
-
-  if (dims.blur) {
-    vars['--react-blur'] = num(BASE_BLUR + amp * power * 10, 1) + 'px';
-  } else {
-    vars['--react-blur'] = BASE_BLUR + 'px';
-  }
-
+  vars['--react-scale'] = dims.scale
+    ? num(1 + amp * power * 0.04 + pulseValue * power * 0.012, 4)
+    : '1';
+  // 反向：能量越高 blur 越小。满功率时 50px → 30px。
+  // 这 20px 不只是「清晰度」，它同时是视差能被看见的前提：blur 降到 46px 以下
+  // 边缘才重新出现，drift 才有可追踪的对象；blur 不动时再怎么加大位移，
+  // 看到的也只是「一片糊移动得更大」。
+  // 真实音乐里非对称包络的 amp 典型值只有 0.6~0.8，所以 K 必须按「典型值也有
+  // 7~9px 变化」来定；K=12 时典型值只有 4~5px，等于只把「完全不可见」改成
+  // 「几乎不可见」。
+  vars['--react-blur'] = dims.blur
+    ? num(BASE_BLUR - amp * power * 20, 1) + 'px'
+    : BASE_BLUR + 'px';
   vars['--react-brightness'] = dims.brightness
-    ? num(1 + amp * power * 0.35, 3)
+    ? num(1 + amp * power * 0.06, 3)
     : '1';
   vars['--react-saturate'] = dims.saturate
-    ? num(1 + amp * power * 0.6, 3)
+    ? num(1 + amp * power * 0.1, 3)
     : '1';
-  vars['--react-hue'] = dims.hue ? num(amp * power * 18, 2) + 'deg' : '0deg';
+  // 26px 而不是 10px：两层反向视差的相对位移只有 1.7 倍差，绝对值太小的话
+  // 在 50px 模糊底图上完全读不出来（默认档曾是 3.4px，用户反馈「几乎没用」）。
+  vars['--react-drift'] = dims.drift ? num(amp * power * 26, 1) + 'px' : '0px';
+  // 辉光不受 dimensions 控制：它只是一层极淡的白光，永远保持很轻，
+  // 不参与「关掉某个维度」的取舍，否则关掉 blur 后画面会完全没有生命感。
+  vars['--react-glow'] = num(
+    clamp(0.06 + pulseValue * 0.2 + amp * 0.06, 0, 0.32),
+    3
+  );
   vars['--react-pulse'] = num(pulseValue, 3);
 
   return vars;
@@ -376,12 +421,18 @@ function sampleFrame() {
     : false;
   pulse = beat ? 1 : pulse * PULSE_DECAY;
 
+  // 非对称包络：起音跟得快、回落得慢。
+  const target = clamp(level / 255, 0, 1);
+  const k = target > smoothLevel ? ATTACK : RELEASE;
+  smoothLevel += (target - smoothLevel) * k;
+
   lastFrame = {
     bass: bands.bass,
     mid: bands.mid,
     treble: bands.treble,
     energy: bands.energy,
     level,
+    smooth: smoothLevel,
     beat,
     pulse,
     degraded,
@@ -449,12 +500,14 @@ export function __resetForTests() {
   stopLoop();
   releaseAnalyser();
   config = normalizeReactiveConfig(DEFAULT_REACTIVE_CONFIG);
+  smoothLevel = 0;
   lastFrame = {
     bass: 0,
     mid: 0,
     treble: 0,
     energy: 0,
     level: 0,
+    smooth: 0,
     beat: false,
     pulse: 0,
     degraded: false,

@@ -166,7 +166,8 @@ export default {
     }
   }
   button.primary {
-    color: var(--color-primary-bg);
+    // 主色实心按钮上的文字：两套主题都用白色，保证对比度
+    color: #fff;
     background: var(--color-primary-gradient);
     font-weight: 500;
   }

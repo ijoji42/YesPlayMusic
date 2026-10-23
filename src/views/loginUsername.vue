@@ -141,7 +141,7 @@ export default {
   .svg-icon {
     height: 22px;
     width: 22px;
-    color: var(--color-primary);
+    color: var(--color-primary-bg-fg);
     margin: {
       left: 12px;
       right: 8px;
@@ -156,9 +156,9 @@ export default {
     width: 115%;
     font-weight: 600;
     margin-top: -1px;
-    color: var(--color-primary);
+    color: var(--color-primary-bg-fg);
     &::placeholder {
-      color: var(--color-primary);
+      color: var(--color-primary-bg-fg);
       opacity: 0.78;
     }
   }
@@ -199,7 +199,7 @@ export default {
   transition: 0.2s;
   background: var(--color-primary-bg);
   .nickname {
-    color: var(--color-primary);
+    color: var(--color-primary-bg-fg);
   }
 }
 </style>

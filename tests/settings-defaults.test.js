@@ -9,7 +9,9 @@ const REACTIVE_KEYS = [
   'band',
   'dimensions',
 ];
-const DIMENSION_KEYS = ['scale', 'blur', 'brightness', 'hue', 'saturate'];
+// 与 audioAnalyser 的 DIMENSION_KEYS 保持同一份清单：hue 已整链路移除，
+// 由 drift（视差漂移）顶替。
+const DIMENSION_KEYS = ['scale', 'blur', 'brightness', 'saturate', 'drift'];
 
 describe('store.initLocalStorage', () => {
   it('ships a lyrics-background default the lyrics page understands', () => {

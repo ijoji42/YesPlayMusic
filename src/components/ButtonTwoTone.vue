@@ -70,7 +70,8 @@ button {
   line-height: 18px;
   font-weight: 600;
   background-color: var(--color-primary-bg);
-  color: var(--color-primary);
+  // 深色下主色浅底变成了深蓝底，蓝字会糊在底上，改用配套前景色（= 正文色）
+  color: var(--color-primary-bg-fg);
   margin-right: 12px;
   transition: 0.2s;
   user-select: none;
