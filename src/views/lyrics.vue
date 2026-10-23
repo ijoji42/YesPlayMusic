@@ -369,7 +369,11 @@ export default {
       return this.player.currentTrack?.al?.picUrl + '?param=1024y1024';
     },
     bgImageUrl() {
-      return this.player.currentTrack?.al?.picUrl + '?param=512y512';
+      // 首启时 _currentTrack 还没有 al（曲目详情尚未拉回来），直接拼串会得到
+      // "undefined?param=512y512"，浏览器会为这个无效地址发一次请求并把背景
+      // 刷黑。默认效果改成「动态」后这条路径每次首启都会走到，所以必须挡住。
+      const picUrl = this.player.currentTrack?.al?.picUrl;
+      return picUrl ? `${picUrl}?param=512y512` : '';
     },
     isShowLyricTypeSwitch() {
       return this.romalyric.length > 0 && this.tlyric.length > 0;

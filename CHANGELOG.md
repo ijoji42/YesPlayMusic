@@ -2,6 +2,30 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式。
 
+## [0.5.2] - 2026-10-24
+
+**0.5.1 已撤回**：装完之后打开是一片白窗口，什么都看不到。这一版修的就是这个问题，
+0.5.1 的全部功能改动原样保留。
+
+### 修复
+
+- **打开白屏（阻断级）**。根因是 `src/utils/Player.js` 在构造函数里新增了
+  `store.watch(...)`，而 `src/store/index.js` 第 108 行 `new Player()`、第 120 行才
+  `export default store`。`Player` 与 `store` 互相 import，构造函数执行的那一刻，
+  `@/store` 的默认导出还是 `undefined`，于是抛
+  `TypeError: Cannot read property 'watch' of undefined`。
+  这是**模块求值期**异常，会中断整个渲染进程启动，`#app` 永远挂不上去 —— 表现就是白窗口。
+  - 现在 watch 注册抽成 `Player.bindSettingsWatchers()`，用微任务推迟到 `store/index.js`
+    同步求值结束之后，并加判空兜底。0.5.0 没有这个问题，因为旧代码在构造函数里从不碰 `store`。
+- **歌词背景「动态」首启时背景发黑**。`bgImageUrl` 在 `currentTrack.al.picUrl` 尚未就绪时
+  会拼出 `undefined?param=512y512`，浏览器为这个无效地址发一次请求、背景刷黑。
+  默认效果改成「动态」后这条路径每次首启都会走到，已加守卫。
+
+### 性能
+
+- `_currentSource` 补进 `TRANSIENT_PROPS`。它是每次 `_playAudioSource` 都会赋值的运行时字段，
+  若不跳过持久化调度，切歌瞬间会触发一次全量快照序列化（整份播放列表 + 曲目对象）。
+
 ## [0.5.1] - 2026-10-24
 
 「把上一版承诺的东西真正做到」。0.5.0 加了律动背景，但实际用起来几乎没效果，

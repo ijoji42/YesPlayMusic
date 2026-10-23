@@ -162,31 +162,12 @@ export default class {
       enumerable: false,
     });
 
-    // 切到律动：允许升级，当前这首立刻生效。
-    // 反方向（律动关掉）由 syncAudioMode 内部的「降级需授权」挡掉。
-    store.watch(
-      state => state.settings?.lyricsBackground,
-      () => {
-        this.syncAudioMode(false);
-      }
-    );
-
-    // 换输出设备：模式可能双向变化，所以允许降级。
-    // 250ms 防抖有两个作用：一是把设备列表里的连点合并成一次重建，
-    // 二是避开 syncAudioMode 的单槽锁——升级要等解码（0.3~2s），
-    // 途中再来的请求会被锁直接吞掉，最终实例会停在错误的音频模式上。
-    store.watch(
-      state => state.settings?.outputDevice,
-      () => {
-        if (this._outputDeviceSyncTimer !== null) {
-          clearTimeout(this._outputDeviceSyncTimer);
-        }
-        this._outputDeviceSyncTimer = setTimeout(() => {
-          this._outputDeviceSyncTimer = null;
-          this.syncAudioMode(true);
-        }, 250);
-      }
-    );
+    // 设置项 watch 的注册时机见 bindSettingsWatchers() 的注释。
+    this._settingsWatchersBound = false;
+    Object.defineProperty(this, '_settingsWatchersBound', {
+      enumerable: false,
+    });
+    Promise.resolve().then(() => this.bindSettingsWatchers());
 
     // 播放信息
     this._list = []; // 播放列表
@@ -260,6 +241,51 @@ export default class {
 
     window.yesplaymusic = {};
     window.yesplaymusic.player = this;
+  }
+
+  /**
+   * 注册依赖设置项的 watch。
+   *
+   * **不能**写在构造函数里直接调用 store.watch()：
+   * src/store/index.js 第 108 行 `new Player()`，而它的 `export default store`
+   * 在第 120 行。Player 与 store 互相 import，构造函数执行的那一刻，本文件
+   * 从 '@/store' 读到的默认导出还是 undefined，`store.watch(...)` 会抛
+   * `TypeError: Cannot read property 'watch' of undefined`。
+   *
+   * 这是**模块求值期**的异常，会中断整个 renderer 的启动 —— 用户看到的就是
+   * 「打开后一片白」。构造函数里用 Promise.resolve().then 推到微任务注册，
+   * 那时 store/index.js 的同步求值已结束，默认导出就位。
+   * 方法本身再兜一层判空，避免任何时序意外把整个应用带崩。
+   */
+  bindSettingsWatchers() {
+    if (this._settingsWatchersBound || !store) return;
+    this._settingsWatchersBound = true;
+
+    // 切到律动：允许升级，当前这首立刻生效。
+    // 反方向（律动关掉）由 syncAudioMode 内部的「降级需授权」挡掉。
+    store.watch(
+      state => state.settings?.lyricsBackground,
+      () => {
+        this.syncAudioMode(false);
+      }
+    );
+
+    // 换输出设备：模式可能双向变化，所以允许降级。
+    // 250ms 防抖有两个作用：一是把设备列表里的连点合并成一次重建，
+    // 二是避开 syncAudioMode 的单槽锁——升级要等解码（0.3~2s），
+    // 途中再来的请求会被锁直接吞掉，最终实例会停在错误的音频模式上。
+    store.watch(
+      state => state.settings?.outputDevice,
+      () => {
+        if (this._outputDeviceSyncTimer !== null) {
+          clearTimeout(this._outputDeviceSyncTimer);
+        }
+        this._outputDeviceSyncTimer = setTimeout(() => {
+          this._outputDeviceSyncTimer = null;
+          this.syncAudioMode(true);
+        }, 250);
+      }
+    );
   }
 
   get repeatMode() {

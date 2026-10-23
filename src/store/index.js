@@ -87,6 +87,10 @@ const TRANSIENT_PROPS = new Set([
   '_loadingTimer',
   '_pendingFadeIn',
   '_pauseSeq',
+  // 当前音源字符串。每次 _playAudioSource 都会赋值，若参与持久化调度，
+  // 切歌瞬间就会触发一次全量快照序列化（整份播放列表 + 曲目对象）。
+  // 它本身不是播放状态，只是升级到 Web Audio 模式时重建实例要用的入参。
+  '_currentSource',
 ]);
 
 /**
