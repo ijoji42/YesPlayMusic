@@ -209,6 +209,14 @@ export default {
           run: () => this.go({ name: 'library' }),
         },
         {
+          key: 'daily',
+          icon: 'arrow-right',
+          label: this.$t('commandPalette.actions.daily'),
+          keywords: ['daily', 'recommend', 'today', '每日', '推荐'],
+          disabled: false,
+          run: () => this.go({ name: 'dailySongs' }),
+        },
+        {
           key: 'search',
           icon: 'arrow-right',
           label: this.$t('commandPalette.actions.search'),
