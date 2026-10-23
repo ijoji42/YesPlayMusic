@@ -14,6 +14,12 @@
 // 3. 读不到频谱时（跨域音源 / 解码失败 / 上下文被挂起）这一帧的能量就是 0，
 //    视觉层自然表现为静止，不需要额外的降级状态，也不需要「假装在动」的兜底。
 // 4. 整个模块不进 Vuex、不进组件 data。每帧只写 CSS 自定义属性，避免整页重渲染。
+// 5. **绝对电平不能直接当幅度用**。真实音乐（尤其是流行乐）的 bass bin 均值
+//    常年 228~240，`level / 255` 归一化出来就是 0.9 以上，所有维度被钉在
+//    映射上限，肉眼看就是「律动完全没作用」。所以这里先过一层自适应增益
+//    （AGC）：用缓慢跟随的 min/max 把当前曲目自己的动态范围拉满，再送进
+//    包络和映射。三个分频段各有一条独立 AGC，因为 treble 的绝对电平比
+//    bass 低一个数量级。
 
 import { Howler } from 'howler';
 
@@ -27,9 +33,36 @@ const TARGET_FPS = 30; // 人眼对背景模糊的变化不敏感，30fps 足够
 const FRAME_INTERVAL = 1000 / TARGET_FPS;
 const BEAT_WINDOW_SECONDS = 0.7;
 const BEAT_FRAMES = Math.max(4, Math.round(BEAT_WINDOW_SECONDS * TARGET_FPS)); // 21
-const MIN_BEAT_LEVEL = 70; // 绝对门限，防止安静段落里的噪声被当成鼓点
 const PULSE_DECAY = 0.86; // 每帧衰减，半衰期约 0.15s
 const BASE_BLUR = 50; // 与 lyrics.vue 里 .lyrics-background 的 blur(50px) 对齐
+// ---------------------------------------------------------------------------
+// 自适应增益（AGC）
+//
+// 直接用 level/255 会把真实音乐压死：流行乐的 bass bin 均值常年 228~240，
+// 归一化后 amp 稳定在 0.9 以上，被钉在映射上限，视觉上就是「纹丝不动」。
+// 这里用一条缓慢跟随的 min/max 把**当前曲目自己的动态范围**拉满。
+//
+// 四个系数是刻意不对称的：
+//   max 快速上跟（0.35）——1~2 帧贴上新峰值，鼓点不会被吃掉；
+//   max 极慢回落（0.0008）——安静段不会把基准拉低，下一拍不会「爆」；
+//   min 快速下跟（0.15）——咬住谷底，但**不能太快**（见下）；
+//   min 慢速上移（0.03）——约 1.5s 恢复，既能跟上段落变化，又不会把基准整体抬起来。
+//
+// min 的两个系数是拿真实曲目逐帧数据标定出来的，不是拍脑袋：
+// 《起风了》的 bass 逐帧值 95% 落在 200~250（均值 222），偶尔有 177 的谷和
+// 起播瞬间的 0。如果 min 用 0.5 下跟、0.0005 上移（初版取值），单个异常帧就会
+// 把 min 钉在 0 附近且再也回不来 —— 实测 min≈169、span≈55，于是 222 的常态帧
+// 归一化出 0.9，整首歌仍然是一条直线（blur 只有 2.5px 变化，pulse 10 秒只跳 1 次）。
+// 改成 0.15/0.03 之后 min 稳定在 222、span 落到 24 的 floor 上，常态帧回到 0~0.8，
+// 同一段音频的 blur 动态范围从 2.5px 变成 9.8px（逐帧实测）。max 的两个系数实测无影响，保持不动。
+// ---------------------------------------------------------------------------
+const AGC_FLOOR_SPAN = 24; // 最小跨度：恒定信号不会被放大成满幅噪声闪烁
+const AGC_MAX_RISE = 0.35;
+const AGC_MAX_FALL = 0.0008;
+const AGC_MIN_FALL = 0.15;
+const AGC_MIN_RISE = 0.03;
+const AGC_SILENCE = 12; // 绝对静音门限：低于它的帧不参与基准，也不输出能量
+const AGC_GAMMA = 0.75; // 提升中间段，避免只在峰值附近才有变化
 // 非对称包络的一阶系数：起音快、释放慢。
 // 对称的平滑会跟着每个鼓点一起抽搐；起音用 0.62 让「一下」立刻到位，
 // 释放用 0.13 让背景缓慢回落，观感上才像「呼吸」而不是「抖动」。
@@ -208,6 +241,18 @@ let lastFrame = {
   smooth: 0,
   beat: false,
   pulse: 0,
+  bassAmp: 0,
+  midAmp: 0,
+  trebleAmp: 0,
+};
+// 四条独立的 AGC：level（被选中那条频段的能量，决定 amp/pulse）加三个分频段。
+// 分频段必须各用一条：treble 的绝对电平（13~59）比 bass（208~246）低一个数量级，
+// 共用一条 AGC 会把 treble 归一化成 0。
+const agcLevel = createAgcTracker();
+const agcBands = {
+  bass: createAgcTracker(),
+  mid: createAgcTracker(),
+  treble: createAgcTracker(),
 };
 const subscribers = new Set();
 let rafId = null;
@@ -277,6 +322,7 @@ export function releaseAnalyser() {
   beatDetector = null;
   pulse = 0;
   smoothLevel = 0;
+  resetAgc();
 }
 
 /** 读取一次频段能量。读不到返回 null。 */
@@ -296,14 +342,23 @@ export function readBands() {
 
 /**
  * 节拍检测器。
- * 当前值超过最近 BEAT_FRAMES 帧移动平均的 (1 + (100-灵敏度)/200) 倍时算一拍。
- * 灵敏度 0 → 阈值 1.5（迟钝），灵敏度 100 → 阈值 1.0（灵敏）。
+ * 当前值超过最近 BEAT_FRAMES 帧移动平均 **加上一个与 AGC 跨度成比例的增量**
+ * 时算一拍。
+ *
+ * 这里刻意不用乘性阈值（`value > mean * 1.22`）：真实音乐里 mean 能到 232，
+ * 乘性阈值就是 284，而 level 上限只有 255 —— 永远不可能触发，pulse 会一直是 0，
+ * --react-glow 也就丢掉它最主要的那一项动态。改成加性阈值之后，阈值随信号
+ * 自身的动态范围（span）缩放，高电平段落同样能检测到鼓点。
+ *
+ * 灵敏度语义不变：sensitivity 越高 → need 越小 → 越容易触发。
+ * 原 MIN_BEAT_LEVEL（绝对门限）的防误触发作用由 need >= 4 承担 ——
+ * 绝对刻度在 AGC 之后已经没有意义。
  */
 export function createBeatDetector(windowFrames) {
   const size = Math.max(2, windowFrames || BEAT_FRAMES);
   const history = [];
   return {
-    push(value, sensitivity) {
+    push(value, sensitivity, span) {
       history.push(value);
       if (history.length > size) history.shift();
       if (history.length < 4) return false;
@@ -311,8 +366,10 @@ export function createBeatDetector(windowFrames) {
       for (let i = 0; i < history.length; i++) sum += history[i];
       const mean = sum / history.length;
       if (mean <= 0) return false;
-      const threshold = 1 + (100 - clamp(sensitivity, 0, 100)) / 200;
-      return value > mean * threshold && value > MIN_BEAT_LEVEL;
+      const s = clamp(sensitivity, 0, 100);
+      const scale = Math.max(AGC_FLOOR_SPAN, span || AGC_FLOOR_SPAN);
+      const need = Math.max(4, scale * (0.16 + ((100 - s) / 100) * 0.26));
+      return value > mean + need;
     },
     reset() {
       history.length = 0;
@@ -335,16 +392,23 @@ function pickLevel(bands, band) {
  * 单独抽出来是为了可测（tests/ 里有对应用例），也方便设置页预览复用。
  *
  * 变量契约（视觉层照此消费，名字和单位都不要改）：
- *   --react-scale       1 ~ 1.052     无单位
- *   --react-blur        50px ~ 30px   能量越高越清晰（聚焦感），不是越大越糊
- *   --react-brightness  1 ~ 1.06      无单位
- *   --react-saturate    1 ~ 1.10      无单位
- *   --react-drift       0px ~ 26px    位移幅度，方向由 CSS 按层决定
- *   --react-glow        0.06 ~ 0.32   辉光层 opacity。**地板是 0.06 而不是 0**：
+ *   --react-scale       1 ~ 1.13      无单位
+ *   --react-blur        50px ~ 28px   能量越高越清晰（聚焦感），不是越大越糊
+ *   --react-brightness  0.82 ~ 1.12   乘数，不是增量
+ *   --react-saturate    1 ~ 1.45      无单位
+ *   --react-drift       0px ~ 72px    位移幅度，方向由 CSS 按层决定
+ *   --react-glow        0.05 ~ 0.75   辉光层 opacity。**地板是 0.05 而不是 0**：
  *                                     律动开着时中心永远有一层极淡的白，CSS 侧
  *                                     不能假设它能淡到全透明（深色主题下那层白
  *                                     本身的 alpha 要压住，否则会像蒙雾）
  *   --react-pulse       0 ~ 1         节拍脉冲
+ *   --react-bass        0 ~ 1         AGC 后的低频能量
+ *   --react-mid         0 ~ 1         AGC 后的中频能量
+ *   --react-treble      0 ~ 1         AGC 后的高频能量
+ *
+ * 区间按「AGC 之后 amp 真的能跑满 0~1」重新定过：旧的 20px/26px 区间是在
+ * amp 被钉死在 0.9 的前提下调的，现在 amp 会真的摆动，同样的系数会显得过冲，
+ * 但按旧值又完全看不出来 —— 所以整体放大，并新增三个分频段变量给视觉层用。
  *
  * 只输出会被 transform / filter / opacity 消费的属性，不碰 width / margin / top
  * 这类会触发重排的键。
@@ -359,37 +423,43 @@ export function mapFrameToVars(frame, cfg) {
   const amp = clamp(rawAmp, 0, 1);
   const power = c.intensity / 100;
   const pulseValue = clamp((frame && frame.pulse) || 0, 0, 1);
+  // 分频段变量没传时回退到 amp：单独调用本函数的场景（测试、预览）
+  // 只有一路能量，退化成同一个值比退化成 0 更可预测。
+  const bandAmp = key => {
+    const v = frame && frame[key];
+    return typeof v === 'number' ? clamp(v, 0, 1) : amp;
+  };
   const vars = {};
 
   vars['--react-scale'] = dims.scale
-    ? num(1 + amp * power * 0.04 + pulseValue * power * 0.012, 4)
+    ? num(1 + amp * power * 0.1 + pulseValue * power * 0.03, 4)
     : '1';
-  // 反向：能量越高 blur 越小。满功率时 50px → 30px。
-  // 这 20px 不只是「清晰度」，它同时是视差能被看见的前提：blur 降到 46px 以下
+  // 反向：能量越高 blur 越小。满功率时 50px → 28px。
+  // 这 22px 不只是「清晰度」，它同时是视差能被看见的前提：blur 降到 46px 以下
   // 边缘才重新出现，drift 才有可追踪的对象；blur 不动时再怎么加大位移，
   // 看到的也只是「一片糊移动得更大」。
-  // 真实音乐里非对称包络的 amp 典型值只有 0.6~0.8，所以 K 必须按「典型值也有
-  // 7~9px 变化」来定；K=12 时典型值只有 4~5px，等于只把「完全不可见」改成
-  // 「几乎不可见」。
   vars['--react-blur'] = dims.blur
-    ? num(BASE_BLUR - amp * power * 20, 1) + 'px'
+    ? num(BASE_BLUR - amp * power * 22, 1) + 'px'
     : BASE_BLUR + 'px';
+  // 0.82 起步而不是 1：能量低时先压暗，给「亮起来」留出上行空间。
   vars['--react-brightness'] = dims.brightness
-    ? num(1 + amp * power * 0.06, 3)
+    ? num(0.82 + amp * power * 0.3, 3)
     : '1';
   vars['--react-saturate'] = dims.saturate
-    ? num(1 + amp * power * 0.1, 3)
+    ? num(1 + amp * power * 0.45, 3)
     : '1';
-  // 26px 而不是 10px：两层反向视差的相对位移只有 1.7 倍差，绝对值太小的话
-  // 在 50px 模糊底图上完全读不出来（默认档曾是 3.4px，用户反馈「几乎没用」）。
-  vars['--react-drift'] = dims.drift ? num(amp * power * 26, 1) + 'px' : '0px';
+  // 72px：在 50px 模糊底图上，位移小于 ~30px 基本读不出来。
+  vars['--react-drift'] = dims.drift ? num(amp * power * 72, 1) + 'px' : '0px';
   // 辉光不受 dimensions 控制：它只是一层极淡的白光，永远保持很轻，
   // 不参与「关掉某个维度」的取舍，否则关掉 blur 后画面会完全没有生命感。
   vars['--react-glow'] = num(
-    clamp(0.06 + pulseValue * 0.2 + amp * 0.06, 0, 0.32),
+    clamp(0.05 + amp * 0.42 + pulseValue * 0.28, 0, 0.75),
     3
   );
   vars['--react-pulse'] = num(pulseValue, 3);
+  vars['--react-bass'] = num(bandAmp('bassAmp'), 3);
+  vars['--react-mid'] = num(bandAmp('midAmp'), 3);
+  vars['--react-treble'] = num(bandAmp('trebleAmp'), 3);
 
   return vars;
 }
@@ -410,19 +480,96 @@ export function getLastFrame() {
   return lastFrame;
 }
 
+/**
+ * 推进一条 AGC 的 min/max，返回当前跨度。
+ *
+ * 首次采样直接用当前值当谷底、并给一个 floor 跨度的峰顶：这样恒定信号
+ * 归一化出来是 0（不会被放大成噪声闪烁），而真实音乐往上走时 max 会
+ * 在 1~2 帧内贴上新峰值。
+ */
+function updateAgc(agc, value) {
+  const v = clamp(value, 0, 255);
+  if (!agc.ready) {
+    agc.min = v;
+    agc.max = v + AGC_FLOOR_SPAN;
+    agc.ready = true;
+    return AGC_FLOOR_SPAN;
+  }
+
+  if (v > agc.max) agc.max += (v - agc.max) * AGC_MAX_RISE;
+  else agc.max -= (agc.max - v) * AGC_MAX_FALL;
+
+  if (v < agc.min) agc.min += (v - agc.min) * AGC_MIN_FALL;
+  else agc.min += (v - agc.min) * AGC_MIN_RISE;
+
+  agc.min = clamp(agc.min, 0, 255 - AGC_FLOOR_SPAN);
+  const span = Math.max(AGC_FLOOR_SPAN, agc.max - agc.min);
+  agc.max = Math.min(255, agc.min + span);
+  return agc.max - agc.min;
+}
+
+/**
+ * 一条 AGC 通道。`push(绝对电平)` 返回 `{ amp, span }`：
+ *   amp  —— 归一化后的 0~1（已做 gamma 提升）
+ *   span —— 当前跨度，节拍检测用它来缩放阈值
+ *
+ * 低于 AGC_SILENCE 的帧直接返回 amp=0，且**不推进基准** —— 静音不该改变增益。
+ * 单独导出是为了让测试能直接驱动这条状态机，不必造一个 AudioContext。
+ */
+export function createAgcTracker() {
+  const agc = { min: 0, max: 0, ready: false, span: AGC_FLOOR_SPAN };
+  return {
+    push(value) {
+      if (!Number.isFinite(value) || value < AGC_SILENCE) {
+        return { amp: 0, span: agc.span };
+      }
+      const span = updateAgc(agc, value);
+      agc.span = span;
+      const raw = clamp((value - agc.min) / span, 0, 1);
+      return { amp: Math.pow(raw, AGC_GAMMA), span };
+    },
+    reset() {
+      agc.min = 0;
+      agc.max = 0;
+      agc.ready = false;
+      agc.span = AGC_FLOOR_SPAN;
+    },
+    state() {
+      return { min: agc.min, max: agc.max, span: agc.span };
+    },
+  };
+}
+
+/** 换歌 / 重新开启律动时丢掉上一首的增益基准。 */
+export function resetAgc() {
+  [agcLevel, agcBands.bass, agcBands.mid, agcBands.treble].forEach(tracker => {
+    tracker.reset();
+  });
+}
+
 function sampleFrame() {
   if (!ensureAnalyser()) return null;
   const bands = readBands();
   if (!bands) return null;
 
   const level = pickLevel(bands, config.band);
+
+  // 三个分频段各自归一化（mid/treble 的绝对电平比 bass 低一个数量级）
+  const bassAmp = agcBands.bass.push(bands.bass).amp;
+  const midAmp = agcBands.mid.push(bands.mid).amp;
+  const trebleAmp = agcBands.treble.push(bands.treble).amp;
+
+  // level 的 AGC 单独一条：它可能来自 'all'（energy），和上面三条不是同一个量。
+  const levelAgc = agcLevel.push(level);
+  const span = levelAgc.span;
+  const target = levelAgc.amp;
+
   const beat = beatDetector
-    ? beatDetector.push(level, config.sensitivity)
+    ? beatDetector.push(level, config.sensitivity, span)
     : false;
   pulse = beat ? 1 : pulse * PULSE_DECAY;
 
   // 非对称包络：起音跟得快、回落得慢。
-  const target = clamp(level / 255, 0, 1);
   const k = target > smoothLevel ? ATTACK : RELEASE;
   smoothLevel += (target - smoothLevel) * k;
 
@@ -435,6 +582,9 @@ function sampleFrame() {
     smooth: smoothLevel,
     beat,
     pulse,
+    bassAmp,
+    midAmp,
+    trebleAmp,
   };
   return lastFrame;
 }
@@ -461,6 +611,10 @@ function tick(now) {
 function startLoop() {
   if (rafId !== null) return;
   if (typeof window === 'undefined') return;
+  // 只有「从停到跑」这一条路径会走到这里（rafId 非空时提前返回），
+  // 也就是订阅者从 0 变 1 的那一刻：换歌 / 重新开启律动都不能沿用
+  // 上一首的增益基准，否则前几帧会拿旧曲目的 min/max 去归一化。
+  resetAgc();
   lastSampleAt = 0;
   rafId = window.requestAnimationFrame(tick);
 }
@@ -509,5 +663,8 @@ export function __resetForTests() {
     smooth: 0,
     beat: false,
     pulse: 0,
+    bassAmp: 0,
+    midAmp: 0,
+    trebleAmp: 0,
   };
 }
