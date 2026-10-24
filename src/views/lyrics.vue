@@ -994,10 +994,11 @@ export default {
 // 只动 transform 与 filter 这两个合成层属性，不碰 width/margin/top，
 // 避免每帧触发布局重排。
 .lyrics-background.reactive-background {
-  // 用纯数字而不是百分比，这样 calc() 里做乘法是安全的
-  // 和 .lyrics-background 的 92% / 112% 同源，两套值必须一起改，
-  // 否则律动模式仍然是断的。
-  --react-base-brightness: 1.12;
+  // 用纯数字而不是百分比，这样 calc() 里做乘法是安全的。
+  // contrast 和 .lyrics-background 的 92% 同源；brightness 则刻意比那边的
+  // 112% 高：律动模式多了一层会压暗的暗幕和 multiply 光斑，底子不亮就没有
+  // 压暗的余量，高潮态会直接塌到发灰。
+  --react-base-brightness: 1.26;
   --react-base-contrast: 0.92;
 
   // 光斑是 ::after 的替代者，背景本身不再需要裁切边界；保留 overflow
@@ -1011,6 +1012,10 @@ export default {
   // 把背景压到 luma 48 —— 浅色主题的歌词是深色字，luma 48 时对比度只有
   // 1.3:1，远低于 4.5:1 的可读下限，字会读不清。所以两层必须解耦：
   // 滤镜给「质感」，暗幕给「亮度呼吸」。
+  //
+  // 基础亮度 1.26 不是随手调的：暗幕压暗之后还要保住「高潮态背景 luma ≥ 110」，
+  // 底子不够亮就没有压暗的余量。1.26 时安静态整帧 luma 135.8（和 team-lead
+  // 已经认可的那版 135.2 基本一致），高潮态 115，两边都达标。
   filter: blur(var(--react-blur, 50px)) contrast(var(--react-base-contrast))
     brightness(var(--react-base-brightness)) saturate(var(--react-saturate, 1));
   // 160ms + ease-out：原来 80ms linear 每帧都在「跳」，没有惯性。
@@ -1072,14 +1077,15 @@ export default {
   z-index: 0;
   pointer-events: none;
   background: #000;
-  // 亮度乘数越低 → 幕越厚。1.12（安静）时全透明，0.82（高潮）时约 0.20。
+  // 亮度乘数越低 → 幕越厚。1.12（安静）时全透明，0.82（高潮）时约 0.10。
   //
-  // 浅色主题刻意压到 0.66（而不是深色的 1.9）：这里的幕会把整片背景压暗，
-  // 而浅色主题的歌词文字是深色的 —— 幕太厚会让文字和背景一起塌到低亮度区，
-  // 对比度跌破可读下限（实测系数 1.35 时高潮态 luma 48，深色字对比度 1.3:1）。
-  // 0.66 时高潮态 luma 约 100，深色字对比度约 70 个色阶，仍远高于阈值。
-  // 浅色主题的可感知幅度由光斑的 multiply 染色承担，不靠全屏压暗。
-  opacity: calc((1.12 - var(--react-brightness, 1.12)) * 0.66);
+  // 浅色主题刻意压到 0.34（而不是深色的 1.9）：这里的幕会把整片背景压暗，
+  // 而浅色主题的歌词是深色字 —— 幕太厚会让文字和背景一起塌到低亮度区。
+  // 实测扫描（暗幕系数 0.66 / 0.42 / 0.30 / 0.22）：系数 0.66 时高潮态整帧
+  // luma 88.5、文字区底色 luma 80，画面发灰；0.34 时整帧 115、文字区 111，
+  // 既保住了「背景不发灰」，也保住了暗幕的可感知幅度（meanAbs 20.8）。
+  // 浅色主题剩下的幅度由光斑的 multiply 染色承担。
+  opacity: calc((1.12 - var(--react-brightness, 1.12)) * 0.34);
   transition: opacity 120ms linear;
 }
 
@@ -1101,6 +1107,10 @@ export default {
   // 主色由 JS 从封面取（node-vibrant 的 DarkMuted）。取不到时按主题回退：
   // 浅色主题用冷灰压暗，深色主题用白光提亮。
   --orb-accent: var(--react-accent, 60, 70, 90);
+  // 浅色主题整体收一档：multiply 会同时压暗背景和它上面的深色文字，
+  // 增益 1 时右侧文字区底色被压到 luma 80（发灰），0.65 时是 111。
+  // 深色主题是 screen 加光，背景越亮字越清楚，不需要收。
+  --orb-gain: 0.65;
   position: absolute;
   border-radius: 50%;
   pointer-events: none;
@@ -1136,6 +1146,7 @@ export default {
 
 [data-theme='dark'] .react-orb {
   --orb-accent: var(--react-accent, 255, 255, 255);
+  --orb-gain: 1;
   mix-blend-mode: screen;
 }
 
@@ -1160,7 +1171,10 @@ export default {
       0
     )
     scale(calc(1 + var(--react-bass, 0) * var(--react-power, 1) * 0.3));
-  opacity: calc((0.1 + var(--react-bass, 0) * 0.55) * var(--react-power, 1));
+  opacity: calc(
+    (0.1 + var(--react-bass, 0) * 0.55) * var(--react-power, 1) *
+      var(--orb-gain, 1)
+  );
 }
 
 .react-orb.b {
@@ -1174,7 +1188,10 @@ export default {
       0
     )
     scale(calc(1 + var(--react-mid, 0) * var(--react-power, 1) * 0.28));
-  opacity: calc((0.08 + var(--react-mid, 0) * 0.42) * var(--react-power, 1));
+  opacity: calc(
+    (0.08 + var(--react-mid, 0) * 0.42) * var(--react-power, 1) *
+      var(--orb-gain, 1)
+  );
 }
 
 // 第三团是右边缘的「溢光」，一半在屏外 —— 做成画面中间一个圆点会像污渍
@@ -1191,7 +1208,8 @@ export default {
     scale(calc(1 + var(--react-pulse, 0) * var(--react-power, 1) * 0.3));
   opacity: calc(
     (0.04 + var(--react-treble, 0) * 0.22 + var(--react-pulse, 0) * 0.16) *
-      var(--react-power, 1)
+      var(--react-power, 1) *
+      var(--orb-gain, 1)
   );
 }
 

@@ -267,9 +267,9 @@ export default {
     left: -25%;
     background-size: cover;
     background-position: center;
-    // 基础亮度和歌词页同源（浅色 1.12 / 深色 0.72）。--react-brightness 的
+    // 基础亮度和歌词页同源（浅色 1.26 / 深色 0.72）。--react-brightness 的
     // 语义已经改成「乘数」，漏掉基础值预览就会比实际页面暗一档。
-    --react-base-brightness: 1.12;
+    --react-base-brightness: 1.26;
     // 模糊半径由 --react-blur 提供，这里只做等比缩小。
     // 亮度**不乘** --react-brightness，和歌词页保持同一套解耦：滤镜给质感，
     // 暗幕给亮度呼吸。两层叠乘会把画面压到深色文字读不清的亮度。
@@ -302,8 +302,9 @@ export default {
     z-index: 0;
     pointer-events: none;
     background: #000;
-    // 浅色档压到 0.66，理由同歌词页：全屏压暗会和深色文字抢对比度。
-    opacity: calc((1.12 - var(--react-brightness, 1.12)) * 0.66);
+    // 浅色档压到 0.34，理由同歌词页：压太厚会把预览压灰，
+    // 用户在设置里看到的就不是实际播放页的亮度。
+    opacity: calc((1.12 - var(--react-brightness, 1.12)) * 0.34);
     transition: opacity 120ms linear;
   }
 
@@ -319,6 +320,8 @@ export default {
 
   .react-orb {
     --orb-accent: var(--react-accent, 60, 70, 90);
+    // 与歌词页同一个增益：浅色 multiply 收一档，深色 screen 不收。
+    --orb-gain: 0.65;
     position: absolute;
     border-radius: 50%;
     pointer-events: none;
@@ -352,7 +355,8 @@ export default {
         )
         scale(calc(1 + var(--react-bass, 0) * var(--react-power, 1) * 0.3));
       opacity: calc(
-        (0.1 + var(--react-bass, 0) * 0.55) * var(--react-power, 1)
+        (0.1 + var(--react-bass, 0) * 0.55) * var(--react-power, 1) *
+          var(--orb-gain, 1)
       );
     }
 
@@ -368,7 +372,8 @@ export default {
         )
         scale(calc(1 + var(--react-mid, 0) * var(--react-power, 1) * 0.28));
       opacity: calc(
-        (0.08 + var(--react-mid, 0) * 0.42) * var(--react-power, 1)
+        (0.08 + var(--react-mid, 0) * 0.42) * var(--react-power, 1) *
+          var(--orb-gain, 1)
       );
     }
 
@@ -385,13 +390,15 @@ export default {
         scale(calc(1 + var(--react-pulse, 0) * var(--react-power, 1) * 0.3));
       opacity: calc(
         (0.04 + var(--react-treble, 0) * 0.22 + var(--react-pulse, 0) * 0.16) *
-          var(--react-power, 1)
+          var(--react-power, 1) *
+          var(--orb-gain, 1)
       );
     }
   }
 
   [data-theme='dark'] & .react-orb {
     --orb-accent: var(--react-accent, 255, 255, 255);
+    --orb-gain: 1;
     mix-blend-mode: screen;
 
     &.b {
