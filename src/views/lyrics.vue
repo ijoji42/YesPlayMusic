@@ -359,6 +359,7 @@ const REACTIVE_VARS = [
   '--react-bass',
   '--react-mid',
   '--react-treble',
+  '--react-power',
 ];
 
 export default {
@@ -390,6 +391,8 @@ export default {
       // 从封面取到的主色，"r, g, b" 形式。光斑用它染色，取不到时由 CSS
       // 里的 var() 回退值接管（深色主题白、浅色主题冷灰）。
       reactiveAccent: '',
+      // 主色旋转 40° 后的互补色，给第二团光斑用，避免两团同色糊成一束追光。
+      reactiveAccentAlt: '',
     };
   },
   computed: {
@@ -505,9 +508,12 @@ export default {
       return this.settings.lyricsBackground === true ? 'dark' : 'auto';
     },
     reactiveAccentStyle() {
-      return this.reactiveAccent
-        ? { '--react-accent': this.reactiveAccent }
-        : {};
+      const style = {};
+      if (this.reactiveAccent) style['--react-accent'] = this.reactiveAccent;
+      if (this.reactiveAccentAlt) {
+        style['--react-accent-alt'] = this.reactiveAccentAlt;
+      }
+      return style;
     },
     // 只有「律动模式 + 歌词页可见 + 正在播放 + 环境支持 Web Audio」
     // 四个条件同时成立时才跑 rAF 循环。关掉任何一个条件都会立刻停掉，
@@ -882,12 +888,19 @@ export default {
           }
           // 取整后再拼串：color 的 rgb().array() 带小数，虽然 rgba() 也吃，
           // 但插进自定义属性里会让每帧的字符串比较变复杂，没有必要。
-          this.reactiveAccent = originColor
-            .rgb()
-            .array()
-            .slice(0, 3)
-            .map(v => Math.round(v))
-            .join(', ');
+          const rgbString = c =>
+            c
+              .rgb()
+              .array()
+              .slice(0, 3)
+              .map(v => Math.round(v))
+              .join(', ');
+          this.reactiveAccent = rgbString(originColor);
+          // 旋转 40° 再提亮一点：两套主题下都要能读出来（浅色靠 multiply
+          // 压暗、深色靠 screen 加光，同一个中间调两边都够用）。
+          this.reactiveAccentAlt = rgbString(
+            originColor.rotate(40).lighten(0.18)
+          );
         })
         .catch(() => {
           // 封面取色失败（跨域 / 无网络 / 调色板为空）时保持空串，
@@ -1084,11 +1097,27 @@ export default {
   // 用 ellipse closest-side 而不是 circle：光斑元素的宽高比跟着视口走，
   // circle 的渐变半径会超出元素短边、在 border-radius 边界被硬切一刀，
   // 画面上就是一圈明显的「等高线」。closest-side 让渐变正好收在椭圆边上。
+  //
+  // 中心 alpha 0.95 + 多段 stop：环宽 ≈ 斜坡长度 / 可用 8-bit 色阶数。
+  // 中心越亮，screen / multiply 之后的 luma 跨度越大、色阶越多、环越细；
+  // 多段 stop 让每一段的局部斜率更均匀，台阶分布更散，更容易被抖动打散。
+  // （实测：两段 0.72→0 时深色高潮态有 6~8 圈宽 40~80px 的同心环。）
   background: radial-gradient(
     ellipse closest-side at 50% 50%,
-    #{'rgba(var(--orb-accent), 0.72)'},
-    #{'rgba(var(--orb-accent), 0)'} 100%
+    #{'rgba(var(--orb-accent), 0.95)'} 0%,
+    #{'rgba(var(--orb-accent), 0.88)'} 14%,
+    #{'rgba(var(--orb-accent), 0.62)'} 30%,
+    #{'rgba(var(--orb-accent), 0.34)'} 46%,
+    #{'rgba(var(--orb-accent), 0.14)'} 60%,
+    #{'rgba(var(--orb-accent), 0.04)'} 70%,
+    #{'rgba(var(--orb-accent), 0)'} 78%
   );
+}
+
+// 第二团用封面主色旋转 40° 的互补色。两团不同色，读起来才是「房间里的光」，
+// 而不是一束打在同一面墙上的追光。
+.react-orb.b {
+  --orb-accent: var(--react-accent-alt, 70, 110, 190);
 }
 
 [data-theme='dark'] .react-orb {
@@ -1096,50 +1125,59 @@ export default {
   mix-blend-mode: screen;
 }
 
-// 三团光斑各自咬住一个频段，位置刻意分开（左上 / 右下 / 正中），
-// 这样它们是三盏独立的灯，而不是糊成一整块聚光灯。
-// 尺寸用 % 而不是 vw/vh：以后复用到设置页的小预览框里也能直接生效。
+[data-theme='dark'] .react-orb.b {
+  --orb-accent: var(--react-accent-alt, 120, 170, 255);
+}
+
+// 三团光斑各自咬住一个频段。位置刻意让大团从左上、中团从右下溢出屏幕：
+// 可见区只截到 alpha 斜坡的上半段，光斑边界被推到屏外，既没有「贴上去的
+// 椭圆轮廓」，也不会在画面正中间堆出一个聚光灯。
+// 尺寸用 % 而不是 vw/vh：设置页 240×140 的预览块可以直接复用同一份比例。
+// --react-bass/mid/treble 是纯能量，没有乘过强度系数，所以这里必须再乘
+// --react-power，否则用户在设置里拖「强度」滑杆对光斑完全无效。
 .react-orb.a {
-  width: 58%;
-  height: 58%;
-  left: -12%;
-  top: -18%;
+  width: 130%;
+  height: 130%;
+  left: -45%;
+  top: -52%;
   transform: translate3d(
-      calc(var(--react-bass, 0) * 30%),
-      calc(var(--react-bass, 0) * 20%),
+      calc(var(--react-bass, 0) * var(--react-power, 1) * 26%),
+      calc(var(--react-bass, 0) * var(--react-power, 1) * 18%),
       0
     )
-    scale(calc(0.9 + var(--react-bass, 0) * 0.42));
-  opacity: calc(0.1 + var(--react-bass, 0) * 0.6);
+    scale(calc(1 + var(--react-bass, 0) * var(--react-power, 1) * 0.3));
+  opacity: calc((0.1 + var(--react-bass, 0) * 0.55) * var(--react-power, 1));
 }
 
 .react-orb.b {
-  width: 54%;
-  height: 54%;
-  right: -12%;
-  bottom: -16%;
+  width: 95%;
+  height: 95%;
+  right: -28%;
+  bottom: -34%;
   transform: translate3d(
-      calc(var(--react-mid, 0) * -26%),
-      calc(var(--react-mid, 0) * -17%),
+      calc(var(--react-mid, 0) * var(--react-power, 1) * -22%),
+      calc(var(--react-mid, 0) * var(--react-power, 1) * -15%),
       0
     )
-    scale(calc(0.86 + var(--react-mid, 0) * 0.38));
-  opacity: calc(0.08 + var(--react-mid, 0) * 0.5);
+    scale(calc(1 + var(--react-mid, 0) * var(--react-power, 1) * 0.28));
+  opacity: calc((0.08 + var(--react-mid, 0) * 0.42) * var(--react-power, 1));
 }
 
+// 第三团是右边缘的「溢光」，一半在屏外 —— 做成画面中间一个圆点会像污渍
 .react-orb.c {
-  width: 32%;
-  height: 32%;
-  left: 34%;
-  top: 30%;
+  width: 60%;
+  height: 60%;
+  left: 66%;
+  top: 10%;
   transform: translate3d(
-      calc(var(--react-treble, 0) * 14%),
-      calc(var(--react-treble, 0) * -11%),
+      calc(var(--react-treble, 0) * var(--react-power, 1) * 12%),
+      calc(var(--react-treble, 0) * var(--react-power, 1) * -9%),
       0
     )
-    scale(calc(1 + var(--react-pulse, 0) * 0.28));
+    scale(calc(1 + var(--react-pulse, 0) * var(--react-power, 1) * 0.3));
   opacity: calc(
-    0.05 + var(--react-treble, 0) * 0.3 + var(--react-pulse, 0) * 0.25
+    (0.04 + var(--react-treble, 0) * 0.22 + var(--react-pulse, 0) * 0.16) *
+      var(--react-power, 1)
   );
 }
 

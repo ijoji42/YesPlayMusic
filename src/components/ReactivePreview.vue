@@ -5,6 +5,19 @@
       class="stage"
       :style="{ backgroundImage: previewImage }"
     ></div>
+    <!-- 和歌词页同构的两层可见信号：暗幕 + 三团光斑。
+         必须是 .stage 的兄弟节点 —— 放进 .stage 里会被它的 filter 建出一个
+         新的层叠上下文，光斑的 mix-blend-mode 混不到背景上，而且实测断层
+         会恶化 3 倍。 -->
+    <div class="react-veil" aria-hidden="true"></div>
+    <div class="react-orbs" :style="accentStyle" aria-hidden="true">
+      <div class="react-orb a"></div>
+      <div class="react-orb b"></div>
+      <div class="react-orb c"></div>
+    </div>
+    <!-- 抖动层：光斑的 alpha 斜坡在 8-bit 下必然出同心环，必须和歌词页用
+         同一份噪声去打散。少了这一层，240×140 的预览块 flatRatio 会到 51%。 -->
+    <div class="react-grain" aria-hidden="true"></div>
     <div class="badge" :class="badgeClass">
       <span class="dot"></span>
       <span>{{ badgeText }}</span>
@@ -14,6 +27,8 @@
 
 <script>
 import { mapState } from 'vuex';
+import * as Vibrant from 'node-vibrant/dist/vibrant.worker.min.js';
+import Color from 'color';
 import {
   subscribe,
   setReactiveConfig,
@@ -46,10 +61,20 @@ export default {
       isLive: false, // true = 真实音频驱动
       visible: false,
       syntheticPulse: 0,
+      // 从封面取到的主色 / 互补色，"r, g, b" 形式。取不到时由 CSS 里的
+      // var() 回退值接管，保证预览块不会因为取色失败而空掉。
+      accent: '',
+      accentAlt: '',
     };
   },
   computed: {
     ...mapState(['player', 'settings']),
+    accentStyle() {
+      const style = {};
+      if (this.accent) style['--react-accent'] = this.accent;
+      if (this.accentAlt) style['--react-accent-alt'] = this.accentAlt;
+      return style;
+    },
     activeConfig() {
       return normalizeReactiveConfig(
         this.config || this.settings.lyricsReactive || DEFAULT_REACTIVE_CONFIG
@@ -92,6 +117,14 @@ export default {
     canUseRealAudio(value) {
       if (value) this.startReal();
       else this.startSynthetic();
+    },
+    // 预览块的光斑要和播放页同色，否则「设置里看到的」和「实际播放页」还是
+    // 两套观感 —— 那正是这次要修的不对称。
+    coverUrl: {
+      immediate: true,
+      handler() {
+        this.loadAccent();
+      },
     },
   },
   mounted() {
@@ -144,11 +177,35 @@ export default {
       }
     },
     applyVars(vars) {
-      const stage = this.$refs.stage;
-      if (!stage) return;
+      // 写到 .reactive-preview 根节点上，让 .stage / .react-veil / .react-orbs
+      // 三个兄弟节点都靠继承拿到同一份值（和歌词页的做法一致）。
+      const root = this.$el;
+      if (!root || !root.style) return;
       Object.keys(vars).forEach(key => {
-        stage.style.setProperty(key, vars[key]);
+        root.style.setProperty(key, vars[key]);
       });
+    },
+    loadAccent() {
+      if (!this.coverUrl) return;
+      Vibrant.from(`${this.coverUrl}?param=256y256`, { colorCount: 1 })
+        .getPalette()
+        .then(palette => {
+          const swatch = palette.DarkMuted || palette.Muted || palette.Vibrant;
+          if (!swatch || !swatch._rgb) return;
+          const originColor = Color.rgb(swatch._rgb);
+          const rgbString = c =>
+            c
+              .rgb()
+              .array()
+              .slice(0, 3)
+              .map(v => Math.round(v))
+              .join(', ');
+          this.accent = rgbString(originColor);
+          this.accentAlt = rgbString(originColor.rotate(40).lighten(0.18));
+        })
+        .catch(() => {
+          // 取色失败就用 CSS 的主题回退色，预览本身照常跑
+        });
     },
     startReal() {
       this.stopAll();
@@ -197,6 +254,9 @@ export default {
   overflow: hidden;
   background: var(--color-secondary-bg);
   flex-shrink: 0;
+  // 让光斑的 mix-blend-mode 只混预览块自己的内容（.stage + 自身背景），
+  // 不去混设置页后面的东西。歌词页靠 z-index 天然隔离，这里要显式声明。
+  isolation: isolate;
 
   .stage {
     position: absolute;
@@ -207,13 +267,18 @@ export default {
     left: -25%;
     background-size: cover;
     background-position: center;
+    // 基础亮度和歌词页同源（浅色 1.12 / 深色 0.72）。--react-brightness 的
+    // 语义已经改成「乘数」，漏掉基础值预览就会比实际页面暗一档。
+    --react-base-brightness: 1.12;
     // 模糊半径由 --react-blur 提供，这里只做等比缩小。
-    // 与歌词页保持一致：去掉 hue-rotate，只留清晰度 / 明度 / 饱和度。
     filter: blur(calc(var(--react-blur, 50px) * 0.2))
-      brightness(var(--react-brightness, 1)) saturate(var(--react-saturate, 1));
+      brightness(
+        calc(var(--react-base-brightness) * var(--react-brightness, 1))
+      )
+      saturate(var(--react-saturate, 1));
     // 叠加视差：方向与歌词页近层一致（左上），幅度减半。
-    // 位移必须和 blur 一样乘 0.2 做等比缩放：drift 是绝对像素值（上限 22px），
-    // 直接用在 240px 的块上会变成 9% 的位移，而歌词页 1400px 视口下只有 1.6%，
+    // 位移必须和 blur 一样乘 0.2 做等比缩放：drift 是绝对像素值，直接用在
+    // 240px 的块上会变成 9% 的位移，而歌词页 1400px 视口下只有 1.6%，
     // 预览会把动感夸大约 6 倍，用户就会照着失真的预览去选预设。
     transform: translate3d(
         calc(var(--react-drift, 0px) * 0.2),
@@ -224,31 +289,131 @@ export default {
     transition: transform 140ms cubic-bezier(0.2, 0, 0, 1),
       filter 160ms cubic-bezier(0.2, 0, 0, 1);
     will-change: transform, filter;
+  }
 
-    // 呼吸辉光：参数与歌词页一致（白色椭圆、随 --react-glow 明灭），
-    // 让用户在设置页看到的明暗节奏就是歌词页里真实的那个。
-    &::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background: radial-gradient(
-        ellipse 60% 55% at 50% 52%,
-        rgba(255, 255, 255, 0.55),
-        rgba(255, 255, 255, 0) 72%
+  [data-theme='dark'] & .stage {
+    --react-base-brightness: 0.72;
+  }
+
+  // 暗幕：和歌词页同一条公式，整块预览随能量明暗呼吸
+  .react-veil {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background: #000;
+    opacity: calc((1.12 - var(--react-brightness, 1.12)) * 1.35);
+    transition: opacity 120ms linear;
+  }
+
+  [data-theme='dark'] & .react-veil {
+    opacity: calc((1.12 - var(--react-brightness, 1.12)) * 1.9);
+  }
+
+  .react-orbs {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+
+  .react-orb {
+    --orb-accent: var(--react-accent, 60, 70, 90);
+    position: absolute;
+    border-radius: 50%;
+    pointer-events: none;
+    mix-blend-mode: multiply;
+    will-change: transform, opacity;
+    transition: transform 120ms cubic-bezier(0.2, 0, 0, 1), opacity 160ms linear;
+    background: radial-gradient(
+      ellipse closest-side at 50% 50%,
+      #{'rgba(var(--orb-accent), 0.95)'} 0%,
+      #{'rgba(var(--orb-accent), 0.88)'} 14%,
+      #{'rgba(var(--orb-accent), 0.62)'} 30%,
+      #{'rgba(var(--orb-accent), 0.34)'} 46%,
+      #{'rgba(var(--orb-accent), 0.14)'} 60%,
+      #{'rgba(var(--orb-accent), 0.04)'} 70%,
+      #{'rgba(var(--orb-accent), 0)'} 78%
+    );
+
+    &.b {
+      --orb-accent: var(--react-accent-alt, 70, 110, 190);
+    }
+
+    &.a {
+      width: 130%;
+      height: 130%;
+      left: -45%;
+      top: -52%;
+      transform: translate3d(
+          calc(var(--react-bass, 0) * var(--react-power, 1) * 26%),
+          calc(var(--react-bass, 0) * var(--react-power, 1) * 18%),
+          0
+        )
+        scale(calc(1 + var(--react-bass, 0) * var(--react-power, 1) * 0.3));
+      opacity: calc(
+        (0.1 + var(--react-bass, 0) * 0.55) * var(--react-power, 1)
       );
-      opacity: var(--react-glow, 0);
-      transition: opacity 140ms cubic-bezier(0.2, 0, 0, 1);
+    }
+
+    &.b {
+      width: 95%;
+      height: 95%;
+      right: -28%;
+      bottom: -34%;
+      transform: translate3d(
+          calc(var(--react-mid, 0) * var(--react-power, 1) * -22%),
+          calc(var(--react-mid, 0) * var(--react-power, 1) * -15%),
+          0
+        )
+        scale(calc(1 + var(--react-mid, 0) * var(--react-power, 1) * 0.28));
+      opacity: calc(
+        (0.08 + var(--react-mid, 0) * 0.42) * var(--react-power, 1)
+      );
+    }
+
+    &.c {
+      width: 60%;
+      height: 60%;
+      left: 66%;
+      top: 10%;
+      transform: translate3d(
+          calc(var(--react-treble, 0) * var(--react-power, 1) * 12%),
+          calc(var(--react-treble, 0) * var(--react-power, 1) * -9%),
+          0
+        )
+        scale(calc(1 + var(--react-pulse, 0) * var(--react-power, 1) * 0.3));
+      opacity: calc(
+        (0.04 + var(--react-treble, 0) * 0.22 + var(--react-pulse, 0) * 0.16) *
+          var(--react-power, 1)
+      );
     }
   }
 
-  // 深色主题下压暗辉光，避免预览块中心发灰
-  [data-theme='dark'] & .stage::after {
-    background: radial-gradient(
-      ellipse 60% 55% at 50% 52%,
-      rgba(255, 255, 255, 0.28),
-      rgba(255, 255, 255, 0) 72%
-    );
+  [data-theme='dark'] & .react-orb {
+    --orb-accent: var(--react-accent, 255, 255, 255);
+    mix-blend-mode: screen;
+
+    &.b {
+      --orb-accent: var(--react-accent-alt, 120, 170, 255);
+    }
+  }
+
+  // 和歌词页 .lyrics-grain 完全同源：opacity 0.08 / normal / sRGB 湍流。
+  // 抖动是唯一能把光斑 alpha 台阶压到肉眼不可见的办法。
+  .react-grain {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    opacity: 0.08;
+    mix-blend-mode: normal;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n' color-interpolation-filters='sRGB'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.86' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-repeat: repeat;
+    background-size: 160px 160px;
+  }
+
+  [data-theme='dark'] & .react-grain {
+    opacity: 0.06;
   }
 
   .badge {
@@ -298,7 +463,8 @@ export default {
 
 @media (prefers-reduced-motion: reduce) {
   .reactive-preview .stage,
-  .reactive-preview .stage::after {
+  .reactive-preview .react-veil,
+  .reactive-preview .react-orb {
     transition: none;
   }
 
