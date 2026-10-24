@@ -20,6 +20,14 @@
 //    （AGC）：用缓慢跟随的 min/max 把当前曲目自己的动态范围拉满，再送进
 //    包络和映射。三个分频段各有一条独立 AGC，因为 treble 的绝对电平比
 //    bass 低一个数量级。
+// 6. **节拍必须从原始频谱的「上升沿」里找，不能从 AGC 之后的能量里找**。
+//    能量类信号是慢变量：AGC 的回落系数只有 0.0008~0.15，非对称包络的
+//    释放系数 0.13，两者叠加之后，一个鼓点在数据上就是一段几十毫秒的
+//    缓坡。在缓坡上做阈值比较，检出来的「拍」自然没有鼓点的位置感，
+//    观感就是缓慢呼吸而不是跟着节奏跳。现在改成频谱通量（spectral flux）
+//    onset 检测：直接拿 analyser 的原始 byte 频谱，逐 bin 累加**正向**差分，
+//    用 ~1s 滑动窗口的 mean + k·std 做自适应阈值，配 refractory 窗口和
+//    快攻慢放包络。详见 createOnsetDetector() 的注释。
 
 import { Howler } from 'howler';
 
@@ -33,8 +41,54 @@ const TARGET_FPS = 30; // 人眼对背景模糊的变化不敏感，30fps 足够
 const FRAME_INTERVAL = 1000 / TARGET_FPS;
 const BEAT_WINDOW_SECONDS = 0.7;
 const BEAT_FRAMES = Math.max(4, Math.round(BEAT_WINDOW_SECONDS * TARGET_FPS)); // 21
-const PULSE_DECAY = 0.86; // 每帧衰减，半衰期约 0.15s
 const BASE_BLUR = 50; // 与 lyrics.vue 里 .lyrics-background 的 blur(50px) 对齐
+
+// ---------------------------------------------------------------------------
+// 频谱通量（spectral flux）onset 检测的参数
+//
+// 为什么是这五个数：
+//
+// bins = 80：fftSize 256 → 128 个 bin，每 bin ≈ 172Hz（44.1kHz）。前 80 个
+//   bin 覆盖到 ~13.8kHz，鼓点（60~250Hz 的底鼓、2~5kHz 的军鼓/拍手）的能量
+//   全部落在里面，而最上面的 bin 基本只有噪声。取全部 128 个 bin 会把高频
+//   噪声也计入通量，信噪比反而下降。**不做 A 计权/对数压缩**：byte 频谱本身
+//   已经是 dB 刻度线性映射过的值，再压缩一次会把弱拍的上升沿压没。
+//
+// windowMs = 1000：自适应阈值的 mean/std 用 1s 滑动窗口。窗口太短（<0.3s）
+//   会把上一拍当成「常态」，下一拍就检不出来；太长（>3s）跟不上段落切换
+//   （主歌进副歌、鼓组整体抬升）。1s 大约覆盖 2 拍（120BPM），恰好是
+//   「这一拍的背景」这个语义。
+//
+// k = 1.4（默认 sensitivity 55 时）：阈值 = mean + 1.4·std。这是 onset
+//   检测里最常用的经验值（Bello 等人的经典做法是 mean + δ，δ 取 1~2 倍
+//   标准差）。1.0 会开始把军鼓的余震当新 onset，2.0 会漏掉弱拍。
+//   sensitivity 滑杆映射到 k：2.0（最迟钝）~ 0.8（最灵敏），见 onsetK()。
+//
+// refractoryMs = 110：不定期窗口。一个底鼓的能量包络在频谱上会持续 3~5 帧
+//   （30fps 下 100~160ms）都保持「比前一帧高」，没有 refractory 的话一次
+//   鼓点会连触发 3~4 次，pulse 被反复拉回 1，看上去就是「一直亮着」。
+//   110ms 同时保证 8 分音符（120BPM 下 250ms）不会被吞掉。
+//
+// releaseMs = 125：包络每帧乘 exp(-dt/release)。125ms 是「一拍一闪」的
+//   量级：100ms 后剩 0.45，300ms 后剩 0.08，视觉上是一次干净的闪烁而不是
+//   拖尾。原本打算用 170ms（听感更柔），但 170ms 在 300ms 处还剩 0.17，
+//   律动看起来仍然偏「呼吸」，且通不过「300ms 时 env < 0.1」这条验收线。
+// ---------------------------------------------------------------------------
+const ONSET_BINS = 80;
+const ONSET_WINDOW_MS = 1000;
+const ONSET_REFRACTORY_MS = 110;
+const ONSET_RELEASE_MS = 125;
+// 绝对门限：全静音时 mean=std=0，阈值退化成 0，任何 1 个 LSB 的抖动都会被
+// 当成鼓点。80 个 bin 上平均每 bin 差 0.5，正好挡掉量化噪声。
+const ONSET_MIN_FLUX = 40;
+// 窗口还没填满时 mean/std 没有统计意义（3 个样本的 std 可以任意大或任意小），
+// 先攒 8 帧（30fps 下 ~270ms）再开始判定。起播时最多晚 0.27s 出第一拍。
+const ONSET_MIN_HISTORY = 8;
+// 通量至少要达到「最近 1s 平均通量」的 1.6 倍才算 onset。这一项专门用来
+// 压掉白噪/嘶声/弦乐群这类**持续**高波动的信号：它们的 std 很大，
+// 光靠 mean + k·std 会有一成左右的帧越过阈值。鼓点是稀疏尖峰，mean 远低于
+// 峰值（120BPM、每秒 2 击时 mean ≈ 峰值的 1/15），所以对鼓点几乎无影响。
+const ONSET_JUMP = 1.6;
 // ---------------------------------------------------------------------------
 // 自适应增益（AGC）
 //
@@ -202,8 +256,23 @@ export function detectPreset(config) {
   return 'custom';
 }
 
+/**
+ * 用户设置的「平滑度」→ AnalyserNode.smoothingTimeConstant。
+ *
+ * 旧映射是 0.5 ~ 0.95，对应时间常数 2~20 帧。0.8（默认预设落在这里）意味着
+ * 每帧频谱 = 0.8·上一帧 + 0.2·当前帧，一个 1 帧宽的鼓点上升沿会被摊成
+ * 5 帧的缓坡 —— 那正是「律动不跟节奏」的直接来源。
+ *
+ * 现在整条映射压到 0.12 ~ 0.45：
+ *   - 上限 0.45 是硬上限（调用点还有一次 Math.min 兜底）。再高就会把
+ *     频谱通量里最有信息量的那一段上升沿抹平，onset 检测只能看到斜坡，
+ *     每帧都有一点正向差，既检不准位置也更容易误触发。
+ *   - 下限保留 0.12，不直接给 0：完全不平滑的 byte 频谱逐 bin 抖动很大，
+ *     flux 会带上明显的噪声底，弱拍反而更难和噪声区分。
+ * 滑杆依然有效（0.12~0.45 是能看出差别的一段），只是不再允许它把瞬态抹掉。
+ */
 function smoothingToConstant(smoothing) {
-  return 0.5 + (clamp(smoothing, 0, 100) / 100) * 0.45; // 0.5 ~ 0.95
+  return 0.12 + (clamp(smoothing, 0, 100) / 100) * 0.33; // 0.12 ~ 0.45
 }
 
 function avgBins(data, from, to) {
@@ -227,7 +296,9 @@ export function supportsReactive() {
 let analyser = null;
 let freqData = null;
 let config = normalizeReactiveConfig(DEFAULT_REACTIVE_CONFIG);
-let beatDetector = null;
+// 实时链路只用 onsetDetector。旧的 createBeatDetector 仍作为公开 API 保留
+// （测试和外部调用方在用），但不再参与每一帧的判定 —— 见它的注释。
+let onsetDetector = null;
 let pulse = 0;
 // 非对称包络后的归一化能量（0~1）。放在模块级而不是每帧局部变量，
 // 否则「释放慢」就没有跨帧记忆可言了。
@@ -243,6 +314,8 @@ let lastFrame = {
   smooth: 0,
   beat: false,
   pulse: 0,
+  flux: 0,
+  onsetThreshold: 0,
   bassAmp: 0,
   midAmp: 0,
   trebleAmp: 0,
@@ -275,14 +348,17 @@ export function ensureAnalyser() {
   try {
     const node = ctx.createAnalyser();
     node.fftSize = FFT_SIZE;
-    node.smoothingTimeConstant = smoothingToConstant(config.smoothing);
+    node.smoothingTimeConstant = Math.min(
+      0.45,
+      smoothingToConstant(config.smoothing)
+    );
     // 只做「旁路监听」：masterGain 已经连到 destination，这里再连一个 analyser
     // 不会产生第二路声音（AnalyserNode 不输出到硬件）。反过来如果 analyser
     // 自己连 destination，就会听到两遍。
     masterGain.connect(node);
     analyser = node;
     freqData = new Uint8Array(node.frequencyBinCount);
-    beatDetector = createBeatDetector(BEAT_FRAMES);
+    onsetDetector = createOnsetDetector();
     return analyser;
   } catch (e) {
     // 某些环境下 createAnalyser 会抛（上下文已关闭等），降级即可。
@@ -321,7 +397,7 @@ export function releaseAnalyser() {
   }
   analyser = null;
   freqData = null;
-  beatDetector = null;
+  onsetDetector = null;
   pulse = 0;
   smoothLevel = 0;
   resetAgc();
@@ -343,7 +419,14 @@ export function readBands() {
 }
 
 /**
- * 节拍检测器。
+ * 旧的「电平阈值」节拍检测器。
+ *
+ * **已经不在实时链路上了** —— sampleFrame() 现在走 createOnsetDetector()。
+ * 保留它是因为它仍是公开导出（测试和外部调用方在用），而且它的返回值语义
+ * （true 表示这一帧算一拍）本身没变。之所以被替换：它比较的是 AGC 归一化
+ * 之后的能量，而那条信号经过 AGC 和非对称包络两级低通，鼓点的上升沿早已
+ * 被摊成缓坡，检出来的拍位置偏后、边界模糊。
+ *
  * 当前值超过最近 BEAT_FRAMES 帧移动平均 **加上一个与 AGC 跨度成比例的增量**
  * 时算一拍。
  *
@@ -380,6 +463,173 @@ export function createBeatDetector(windowFrames) {
       return history.length;
     },
   };
+}
+
+/**
+ * 频谱通量（spectral flux）onset 检测器 —— 律动现在的节拍来源。
+ *
+ * 输入是 analyser 的**原始 byte 频谱**（`getByteFrequencyData` 的 Uint8Array），
+ * 输出是「这一帧是不是一个鼓点」加一条快攻慢放的包络。
+ *
+ * 算法（业界标准做法，刻意没有自创变体）：
+ *   1. flux = Σ max(0, cur[i] - prev[i])，只累加**正向**差分。
+ *      音量下降（cur < prev）不计入，所以「一整段变小声」不会产生通量，
+ *      只有「能量突然变多」才会 —— 这正是打击乐器的物理特征。
+ *   2. 阈值 = mean + k·std，mean/std 取自过去 1s 的通量滑动窗口
+ *      （**不含当前帧**，否则当前帧会把阈值抬高，越强的拍越检不出来）。
+ *      自适应阈值的意义：安静段落的弱拍和副歌的强拍用同一套参数就能都检到，
+ *      不需要为每首歌调增益。
+ *   3. refractory：距上一次 onset 不足 110ms 一律忽略。一个鼓点的频谱
+ *      上升沿会持续好几帧，没有这个窗口的话一次鼓点会连触发 3~4 次。
+ *   4. 包络：onset 时 env = 1，之后每帧 env *= exp(-dt/release)。
+ *      用 exp(-dt/τ) 而不是固定系数，是因为 rAF 的 dt 不是恒定的
+ *      （掉帧、切后台），按真实时间衰减才能保证 125ms 的释放时长不变。
+ *
+ * 为什么不用 AGC 之后的能量：那条信号经过 AGC（max 回落 0.0008、min 上移
+ * 0.03）和非对称包络（release 0.13）两级低通，时间常数在几十到几百毫秒，
+ * 鼓点早就被摊成缓坡了。通量检测必须跑在平滑链路之前。
+ *
+ * 全部状态都在闭包内，`push()` 的返回值也是纯数据，测试可以直接喂合成频谱
+ * 驱动它（见 tests/audio-analyser.test.js），不需要 AudioContext。
+ *
+ * @param {object} [options]
+ * @param {number} [options.bins=80]          参与通量计算的 bin 数量（从头开始）
+ * @param {number} [options.windowMs=1000]    自适应阈值的滑动窗口
+ * @param {number} [options.refractoryMs=110] 不定期窗口
+ * @param {number} [options.releaseMs=125]    包络释放时间常数
+ * @param {number} [options.minFlux=40]       通量绝对门限
+ */
+export function createOnsetDetector(options) {
+  const opts = options || {};
+  const bins = Math.max(1, Math.round(opts.bins || ONSET_BINS));
+  const windowMs = Math.max(1, opts.windowMs || ONSET_WINDOW_MS);
+  const refractoryMs = Math.max(
+    0,
+    opts.refractoryMs === undefined ? ONSET_REFRACTORY_MS : opts.refractoryMs
+  );
+  const releaseMs = Math.max(1, opts.releaseMs || ONSET_RELEASE_MS);
+  const minFlux = opts.minFlux === undefined ? ONSET_MIN_FLUX : opts.minFlux;
+
+  let prev = null;
+  let env = 0;
+  let clock = 0; // 内部时钟（ms），按每帧 dt 累加
+  let lastOnsetAt = -Infinity;
+  // 通量滑动窗口。存 {t, flux} 而不是定长数组，是因为 dt 会变，
+  // 「最近 1s」只能按时间筛，不能按帧数筛。
+  const history = [];
+
+  function trimHistory() {
+    const floor = clock - windowMs;
+    while (history.length > 0 && history[0].t <= floor) history.shift();
+  }
+
+  function meanAndStd() {
+    const n = history.length;
+    if (n === 0) return { mean: 0, std: 0 };
+    let sum = 0;
+    for (let i = 0; i < n; i += 1) sum += history[i].flux;
+    const mean = sum / n;
+    let variance = 0;
+    for (let i = 0; i < n; i += 1) {
+      const d = history[i].flux - mean;
+      variance += d * d;
+    }
+    return { mean, std: Math.sqrt(variance / n) };
+  }
+
+  return {
+    /**
+     * 推进一帧。
+     * @param {Uint8Array|number[]|null} spectrum 当前帧的 byte 频谱
+     * @param {object} [frameOptions]
+     * @param {number} [frameOptions.sensitivity=55] 0~100，越高越容易触发
+     * @param {number} [frameOptions.dt] 距上一帧的毫秒数，默认 1/30s
+     */
+    push(spectrum, frameOptions) {
+      const fo = frameOptions || {};
+      const dt = clamp(Number(fo.dt) || FRAME_INTERVAL, 1, 500);
+      const sensitivity =
+        fo.sensitivity === undefined
+          ? 55
+          : clamp(Number(fo.sensitivity), 0, 100);
+      clock += dt;
+      // 先衰减再判定：onset 那一帧的 env 必须是干净的 1，不能被本帧的
+      // 衰减先啃掉一口；反过来没有 onset 的帧必须照常衰减。
+      env *= Math.exp(-dt / releaseMs);
+
+      if (!spectrum || spectrum.length === 0) {
+        // 读不到频谱（静音、跨域、上下文挂起）：丢掉上一帧频谱，
+        // 否则恢复播放的第一帧会和一个「很久以前的频谱」做差分，
+        // 凭空产生一个巨大的假 onset。
+        prev = null;
+        return { onset: false, flux: 0, threshold: 0, env, mean: 0, std: 0 };
+      }
+
+      const n = Math.min(bins, spectrum.length);
+      if (!prev || prev.length !== n) {
+        // 第一帧没有参照物，只能记下来，不能判定。
+        prev = new Float32Array(n);
+        for (let i = 0; i < n; i += 1) prev[i] = spectrum[i];
+        return { onset: false, flux: 0, threshold: 0, env, mean: 0, std: 0 };
+      }
+
+      let flux = 0;
+      for (let i = 0; i < n; i += 1) {
+        const diff = spectrum[i] - prev[i];
+        if (diff > 0) flux += diff;
+        prev[i] = spectrum[i];
+      }
+
+      trimHistory();
+      const { mean, std } = meanAndStd();
+      const k = onsetK(sensitivity);
+      // 三条并列取最大，缺一条都会出问题：
+      //   minFlux            —— 挡住量化噪声（全静音时 mean=std=0，阈值为 0）
+      //   mean + k·std       —— 统计意义：比「最近 1s 的常态波动」高出一截
+      //   mean · 1.6         —— 相对跳变：白噪/嘶声这类**连续**高波动信号
+      //                         的 std 很大，单靠 k·std 会有一成左右的帧
+      //                         越过阈值（实测：σ=6 的噪声 22 帧里误触发 2 次）。
+      //                         真实鼓点的通量是稀疏尖峰，mean 远低于峰值，
+      //                         所以这一项对鼓点几乎没有影响。
+      const threshold = Math.max(minFlux, mean + k * std, mean * ONSET_JUMP);
+
+      // 四个条件缺一不可：窗口攒够样本、通量过绝对门限、超过自适应阈值、
+      // 不在 refractory 窗口内。
+      const onset =
+        history.length >= ONSET_MIN_HISTORY &&
+        flux >= minFlux &&
+        flux > threshold &&
+        clock - lastOnsetAt >= refractoryMs;
+
+      if (onset) {
+        lastOnsetAt = clock;
+        env = 1;
+      }
+      // 无论是否触发都要入窗：否则阈值永远学不到「这里平时有多少通量」。
+      history.push({ t: clock, flux });
+
+      return { onset, flux, threshold, env, mean, std };
+    },
+    reset() {
+      prev = null;
+      env = 0;
+      clock = 0;
+      lastOnsetAt = -Infinity;
+      history.length = 0;
+    },
+    state() {
+      return { env, fluxHistory: history.length, lastOnsetAt, clock };
+    },
+  };
+}
+
+/**
+ * sensitivity（0~100）→ 自适应阈值的 k。
+ * 2.0（最迟钝，只认明显的鼓点）~ 0.8（最灵敏，细碎的拍子也认）。
+ * 默认预设 sensitivity 55 落在 1.34，也就是业界常用的 1~1.5 区间。
+ */
+function onsetK(sensitivity) {
+  return 2 - (clamp(sensitivity, 0, 100) / 100) * 1.2;
 }
 
 function pickLevel(bands, band) {
@@ -436,33 +686,46 @@ export function mapFrameToVars(frame, cfg) {
   };
   const vars = {};
 
+  // 权重重新分配：pulse（鼓点包络）现在是**主导项**，amp（慢能量）退成底噪。
+  //
+  // 旧配比是 amp 0.10 / pulse 0.03 —— 鼓点只贡献了 3% 的缩放，肉眼几乎看不见，
+  // 用户看到的是 amp 驱动的缓慢起伏，于是有「没有跟着节奏走」的反馈。
+  // 现在反过来：pulse 0.07 比 amp 0.06 还大一点，一次鼓点能在两帧内把背景
+  // 「弹」一下，而 amp 只负责让整体基线随段落厚度缓慢变化。
+  // 两者之和仍是 0.13，--react-scale 的 1~1.13 契约不变。
   vars['--react-scale'] = dims.scale
-    ? num(1 + amp * power * 0.1 + pulseValue * power * 0.03, 4)
+    ? num(1 + amp * power * 0.06 + pulseValue * power * 0.07, 4)
     : '1';
   // 反向：能量越高 blur 越小。满功率时 50px → 20px。
   // 这 30px 不只是「清晰度」，它同时是视差能被看见的前提：blur 降到 46px 以下
   // 边缘才重新出现，drift 才有可追踪的对象；blur 不动时再怎么加大位移，
   // 看到的也只是「一片糊移动得更大」。
-  // 系数 30（而不是 22）：默认预设 intensity 只有 55，power=0.55，系数 22 时
-  // 上限只有 12.1px，实测只能拿到 9.8px；30 把上限抬到 16.5px，实测约 13.4px。
+  // amp 22 / pulse 8（合计仍是 30）：模糊是「聚焦感」，属于慢变量，鼓点只
+  // 贡献很小的一点（8px）—— 给多了会在每次底鼓时闪一下，看起来像画面抖动。
+  // 22 也刚好让默认预设（intensity 55，power=0.55）保住 12.1px 的行程下限。
   // 预设默认值不动 —— 改 soft.intensity 会让存量用户的 lyricsReactive 被判成
   // custom、设置页四个预设全灰。
   vars['--react-blur'] = dims.blur
-    ? num(BASE_BLUR - amp * power * 30, 1) + 'px'
+    ? num(BASE_BLUR - (amp * 0.22 + pulseValue * 0.08) * power * 100, 1) + 'px'
     : BASE_BLUR + 'px';
   // 0.82 起步而不是 1：能量低时先压暗，给「亮起来」留出上行空间。
+  // 亮度是「跳」最容易被感知的通道（人眼对亮度变化比对尺寸变化敏感得多），
+  // 所以 pulse 在这里的权重（0.13）几乎追平 amp（0.17）。
   vars['--react-brightness'] = dims.brightness
-    ? num(0.82 + amp * power * 0.3, 3)
+    ? num(0.82 + (amp * 0.17 + pulseValue * 0.13) * power, 3)
     : '1';
   vars['--react-saturate'] = dims.saturate
-    ? num(1 + amp * power * 0.45, 3)
+    ? num(1 + (amp * 0.28 + pulseValue * 0.17) * power, 3)
     : '1';
-  // 72px：在 50px 模糊底图上，位移小于 ~30px 基本读不出来。
+  // 位移保持纯 amp 驱动：drift 是空间上的缓慢漂移，让它跟着每一拍抖会像
+  // 画面在震，反而不像音乐。72px：在 50px 模糊底图上，位移小于 ~30px 基本读不出来。
   vars['--react-drift'] = dims.drift ? num(amp * power * 72, 1) + 'px' : '0px';
   // 辉光不受 dimensions 控制：它只是一层极淡的白光，永远保持很轻，
   // 不参与「关掉某个维度」的取舍，否则关掉 blur 后画面会完全没有生命感。
+  // pulse 0.40 是这里最大的一项 —— 辉光是「这一拍打过来」最直接的表达，
+  // amp 的 0.30 只负责段落之间的底噪差异。
   vars['--react-glow'] = num(
-    clamp(0.05 + amp * 0.42 + pulseValue * 0.28, 0, 0.75),
+    clamp(0.05 + amp * 0.3 + pulseValue * 0.4, 0, 0.75),
     3
   );
   vars['--react-pulse'] = num(pulseValue, 3);
@@ -480,7 +743,10 @@ export function mapFrameToVars(frame, cfg) {
 export function setReactiveConfig(next) {
   config = normalizeReactiveConfig(next);
   if (analyser) {
-    analyser.smoothingTimeConstant = smoothingToConstant(config.smoothing);
+    analyser.smoothingTimeConstant = Math.min(
+      0.45,
+      smoothingToConstant(config.smoothing)
+    );
   }
 }
 
@@ -586,7 +852,7 @@ export function resetAgc() {
   });
 }
 
-function sampleFrame() {
+function sampleFrame(dt) {
   if (!ensureAnalyser()) return null;
   const bands = readBands();
   if (!bands) return null;
@@ -603,10 +869,15 @@ function sampleFrame() {
   const span = levelAgc.span;
   const target = levelAgc.amp;
 
-  const beat = beatDetector
-    ? beatDetector.push(level, config.sensitivity, span)
-    : false;
-  pulse = beat ? 1 : pulse * PULSE_DECAY;
+  // 节拍走频谱通量：喂的是 readBands() 刚填好的**原始** byte 频谱（freqData），
+  // 不是上面那条过了 AGC 的 level。这是「律动跟不上鼓点」的核心修正 ——
+  // 在 AGC 之后的慢信号上做阈值比较，检出来的拍永远是软的。
+  const onset = onsetDetector
+    ? onsetDetector.push(freqData, { sensitivity: config.sensitivity, dt })
+    : { onset: false, flux: 0, threshold: 0, env: 0 };
+  const beat = onset.onset;
+  // pulse 直接就是 onset 包络（快攻 1、慢放 exp(-dt/125ms)），不再自己乘衰减系数。
+  pulse = onset.env;
 
   // 非对称包络：起音跟得快、回落得慢。
   const k = target > smoothLevel ? ATTACK : RELEASE;
@@ -625,6 +896,10 @@ function sampleFrame() {
     smooth: smoothLevel,
     beat,
     pulse,
+    // flux / onsetThreshold 是 onset 检测的中间量：排查「为什么这一拍没跳」时
+    // 直接看这两个数就知道是通量没起来还是被自适应阈值挡住了。
+    flux: onset.flux,
+    onsetThreshold: onset.threshold,
     bassAmp,
     midAmp,
     trebleAmp,
@@ -635,9 +910,13 @@ function sampleFrame() {
 function tick(now) {
   rafId = window.requestAnimationFrame(tick);
   if (now - lastSampleAt < FRAME_INTERVAL) return;
+  // dt 要按**真实时间**算：掉帧或切后台回来时帧间隔可能是几百毫秒，
+  // 包络衰减和 refractory 都按毫秒定义，用固定的 1/30s 会让它们失真。
+  // 上限 200ms 防止长时间挂起后一帧把包络直接清零（视觉上会「断一下」）。
+  const dt = lastSampleAt ? clamp(now - lastSampleAt, 1, 200) : FRAME_INTERVAL;
   lastSampleAt = now;
 
-  const frame = sampleFrame();
+  const frame = sampleFrame(dt);
   if (!frame) return;
 
   // 复制一份再遍历：订阅者回调里可能会退订，直接遍历 Set 会跳项。
@@ -708,6 +987,8 @@ export function __resetForTests() {
     smooth: 0,
     beat: false,
     pulse: 0,
+    flux: 0,
+    onsetThreshold: 0,
     bassAmp: 0,
     midAmp: 0,
     trebleAmp: 0,

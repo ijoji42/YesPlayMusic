@@ -368,5 +368,191 @@ describe('audioAnalyser', () => {
         'soft'
       );
     });
+
+    // ---------------------------------------------------------------------
+    // 频谱通量 onset 检测
+    //
+    // 这一组是「律动不跟着鼓点走」的回归防线。旧的检测跑在 AGC 之后的慢
+    // 信号上，鼓点的上升沿被两级低通抹成缓坡，检出来的拍位置偏后、边界模糊，
+    // 观感就是缓慢呼吸。现在改成原始频谱的正向差分 + 自适应阈值 + 快攻慢放
+    // 包络，下面用合成频谱直接驱动这条链路（不需要 AudioContext）。
+    // ---------------------------------------------------------------------
+
+    // 合成 120BPM 点击音轨：60fps 下每 30 帧一个尖峰（500ms = 120BPM）。
+    // 低频 10 个 bin 在 60 ↔ 200 之间跳，其余 bin 恒为 20 —— 通量只可能来自
+    // 这 10 个 bin，140 × 10 = 1400，和非点击帧的 0 是干净的两档。
+    const CLICK_FRAMES = 30;
+    const FRAME_60FPS = 1000 / 60;
+
+    const clickSpectrum = on => {
+      const spec = new Array(128).fill(20);
+      for (let i = 0; i < 10; i += 1) spec[i] = on ? 200 : 60;
+      return spec;
+    };
+
+    const flatSpectrum = level => new Array(128).fill(level);
+
+    // 跑一段点击音轨，返回 { beats, onsets, maxLag }。
+    const runClickTrack = (frames, spectrumOf, sensitivity) => {
+      const detector = analyser.createOnsetDetector();
+      const beats = [];
+      const onsets = [];
+      for (let frame = 0; frame < frames; frame += 1) {
+        const isBeat = frame > 0 && frame % CLICK_FRAMES === 0;
+        if (isBeat) beats.push(frame);
+        const result = detector.push(spectrumOf(isBeat), {
+          sensitivity: sensitivity === undefined ? 55 : sensitivity,
+          dt: FRAME_60FPS,
+        });
+        if (result.onset) onsets.push(frame);
+      }
+      let maxLag = 0;
+      onsets.forEach(frame => {
+        const nearest = beats.reduce(
+          (best, beat) =>
+            Math.abs(beat - frame) < Math.abs(best - frame) ? beat : best,
+          beats[0]
+        );
+        maxLag = Math.max(maxLag, Math.abs(nearest - frame));
+      });
+      return { beats, onsets, maxLag };
+    };
+
+    it('detects a 120 BPM click track with at most 2 frames of lag', () => {
+      assert.equal(typeof analyser.createOnsetDetector, 'function');
+      const { beats, onsets, maxLag } = runClickTrack(
+        CLICK_FRAMES * 16 + 1,
+        clickSpectrum
+      );
+
+      // 16 拍，允许 ±1（起播时窗口没填满，第一拍可能被推迟一帧）
+      assert.ok(
+        Math.abs(onsets.length - beats.length) <= 1,
+        `expected ~${beats.length} onsets, got ${onsets.length}`
+      );
+      // 核心指标：检出的拍必须贴着点击帧，滞后 ≤ 2 帧（60fps 下 33ms）
+      assert.ok(
+        maxLag <= 2,
+        `onset lag is ${maxLag} frames (${onsets.join(',')} vs ${beats.join(
+          ','
+        )})`
+      );
+    });
+
+    it('keeps detecting clicks when the absolute level is very different', () => {
+      // 自适应阈值的意义：同样的算法不用为每首歌/每个段落调增益。
+      // 弱电平（20→90）和已经贴顶的电平（200→255，只剩 55 的上升空间）都要能检到。
+      const quiet = runClickTrack(CLICK_FRAMES * 8 + 1, on => {
+        const spec = new Array(128).fill(20);
+        for (let i = 0; i < 10; i += 1) spec[i] = on ? 90 : 20;
+        return spec;
+      });
+      const loud = runClickTrack(CLICK_FRAMES * 8 + 1, on => {
+        const spec = new Array(128).fill(200);
+        for (let i = 0; i < 10; i += 1) spec[i] = on ? 255 : 200;
+        return spec;
+      });
+      assert.ok(
+        Math.abs(quiet.onsets.length - quiet.beats.length) <= 1,
+        `quiet track: ${quiet.onsets.length}/${quiet.beats.length}`
+      );
+      assert.ok(
+        Math.abs(loud.onsets.length - loud.beats.length) <= 1,
+        `loud track: ${loud.onsets.length}/${loud.beats.length}`
+      );
+    });
+
+    it('never fires an onset on a constant spectrum', () => {
+      const detector = analyser.createOnsetDetector();
+      let onsets = 0;
+      for (let frame = 0; frame < 90; frame += 1) {
+        if (detector.push(flatSpectrum(232), { dt: FRAME_60FPS }).onset) {
+          onsets += 1;
+        }
+      }
+      // 稳态信号的通量恒为 0，不能被当成鼓点
+      assert.equal(onsets, 0);
+    });
+
+    it('produces no flux when the level only falls', () => {
+      const detector = analyser.createOnsetDetector();
+      let maxFlux = 0;
+      let onsets = 0;
+      for (let frame = 0; frame < 20; frame += 1) {
+        const result = detector.push(flatSpectrum(frame < 10 ? 240 : 200), {
+          dt: FRAME_60FPS,
+        });
+        if (frame >= 10) {
+          maxFlux = Math.max(maxFlux, result.flux);
+          onsets += result.onset ? 1 : 0;
+        }
+      }
+      // 240 → 200 全是下降沿，正向差分恒为 0
+      assert.equal(maxFlux, 0);
+      assert.equal(onsets, 0);
+    });
+
+    it('counts two adjacent spikes as a single onset', () => {
+      // refractory 窗口 110ms：60fps 下 33ms 内的第二个尖峰必须被吞掉，
+      // 否则一个鼓点会连触发好几帧，pulse 被反复拉回 1，看上去就是「一直亮着」。
+      const detector = analyser.createOnsetDetector();
+      const pattern = [false, false, false, false, false, false, false, false];
+      const script = pattern.concat([true, false, true]);
+      let onsets = 0;
+      script.forEach(on => {
+        if (detector.push(clickSpectrum(on), { dt: FRAME_60FPS }).onset) {
+          onsets += 1;
+        }
+      });
+      assert.equal(onsets, 1);
+    });
+
+    it('decays the pulse envelope below 0.6 at 100ms and 0.1 at 300ms', () => {
+      // dt 用 10ms 而不是 16.67ms，是为了让「100ms / 300ms」正好落在整帧上，
+      // 断言不会被帧对齐误差干扰（detector 内部按真实毫秒衰减）。
+      const detector = analyser.createOnsetDetector();
+      for (let i = 0; i < 10; i += 1) {
+        detector.push(clickSpectrum(false), { dt: 10 });
+      }
+      const hit = detector.push(clickSpectrum(true), { dt: 10 });
+      assert.equal(hit.onset, true);
+      assert.equal(hit.env, 1);
+
+      let env100 = 1;
+      let env300 = 1;
+      for (let ms = 10; ms <= 300; ms += 10) {
+        const result = detector.push(clickSpectrum(false), { dt: 10 });
+        if (ms === 100) env100 = result.env;
+        env300 = result.env;
+      }
+      assert.ok(env100 < 0.6, `env at 100ms is ${env100}`);
+      assert.ok(env300 < 0.1, `env at 300ms is ${env300}`);
+      // 单调衰减：中途不能出现回升（回升就意味着有误触发的 onset）
+      assert.ok(env100 > env300);
+    });
+
+    // 映射权重：鼓点包络必须比慢能量更容易被看见，否则又会退回「缓慢呼吸」。
+    it('lets the beat envelope drive scale and glow more than slow energy', () => {
+      const ampOnly = analyser.mapFrameToVars({ level: 255, pulse: 0 }, ALL_ON);
+      const pulseOnly = analyser.mapFrameToVars({ level: 0, pulse: 1 }, ALL_ON);
+
+      assert.ok(
+        Number(pulseOnly['--react-scale']) > Number(ampOnly['--react-scale']),
+        `scale: pulse ${pulseOnly['--react-scale']} should beat amp ${ampOnly['--react-scale']}`
+      );
+      // 一拍打过来，即使在最安静的帧上也要有肉眼可见的位移量
+      assert.ok(
+        Number(pulseOnly['--react-scale']) >= 1.05,
+        `scale jump ${pulseOnly['--react-scale']} is too small`
+      );
+      assert.ok(
+        parseFloat(pulseOnly['--react-glow']) >= 0.4,
+        `glow jump ${pulseOnly['--react-glow']} is too small`
+      );
+      assert.ok(
+        parseFloat(pulseOnly['--react-brightness']) >= 0.93,
+        `brightness jump ${pulseOnly['--react-brightness']} is too small`
+      );
+    });
   }
 });
