@@ -1006,9 +1006,13 @@ export default {
 
   // 去掉了 hue-rotate：整片背景跟着能量整体换色，是最强的「廉价」信号，
   // 也是用户说的「杀马特」感的来源。现在只保留清晰度 / 明度 / 饱和度三个维度。
+  // 浅色主题：亮度变化**只**由暗幕承担，滤镜里的 brightness 保持恒定。
+  // 这里再乘一次 --react-brightness 会和暗幕的乘法叠加（0.92 × 0.80），
+  // 把背景压到 luma 48 —— 浅色主题的歌词是深色字，luma 48 时对比度只有
+  // 1.3:1，远低于 4.5:1 的可读下限，字会读不清。所以两层必须解耦：
+  // 滤镜给「质感」，暗幕给「亮度呼吸」。
   filter: blur(var(--react-blur, 50px)) contrast(var(--react-base-contrast))
-    brightness(calc(var(--react-base-brightness) * var(--react-brightness, 1)))
-    saturate(var(--react-saturate, 1));
+    brightness(var(--react-base-brightness)) saturate(var(--react-saturate, 1));
   // 160ms + ease-out：原来 80ms linear 每帧都在「跳」，没有惯性。
   // 慢一倍并让曲线头快尾缓，变化才是被推出去的，而不是硬切。
   transition: filter 160ms cubic-bezier(0.2, 0, 0, 1);
@@ -1018,6 +1022,10 @@ export default {
 [data-theme='dark'] .lyrics-background.reactive-background {
   --react-base-brightness: 0.72;
   --react-base-contrast: 1.12;
+  // 深色主题的文字是浅色，背景越暗对比度反而越高，可以放心叠乘。
+  filter: blur(var(--react-blur, 50px)) contrast(var(--react-base-contrast))
+    brightness(calc(var(--react-base-brightness) * var(--react-brightness, 1)))
+    saturate(var(--react-saturate, 1));
 }
 
 // 两层景深：近层（右上，压在歌词前面）跟着缩放 + 大幅漂移，
@@ -1064,13 +1072,19 @@ export default {
   z-index: 0;
   pointer-events: none;
   background: #000;
-  // 亮度乘数越低 → 幕越厚。1.12（安静）时全透明，0.82（高潮）时约 0.41。
-  // 深色主题底子本来就更暗，系数给到 1.9，高潮时约 0.57。
-  opacity: calc((1.12 - var(--react-brightness, 1.12)) * 1.35);
+  // 亮度乘数越低 → 幕越厚。1.12（安静）时全透明，0.82（高潮）时约 0.20。
+  //
+  // 浅色主题刻意压到 0.66（而不是深色的 1.9）：这里的幕会把整片背景压暗，
+  // 而浅色主题的歌词文字是深色的 —— 幕太厚会让文字和背景一起塌到低亮度区，
+  // 对比度跌破可读下限（实测系数 1.35 时高潮态 luma 48，深色字对比度 1.3:1）。
+  // 0.66 时高潮态 luma 约 100，深色字对比度约 70 个色阶，仍远高于阈值。
+  // 浅色主题的可感知幅度由光斑的 multiply 染色承担，不靠全屏压暗。
+  opacity: calc((1.12 - var(--react-brightness, 1.12)) * 0.66);
   transition: opacity 120ms linear;
 }
 
 [data-theme='dark'] .react-veil {
+  // 深色主题文字是浅色，背景越暗对比度越高，可以放心给到 0.57。
   opacity: calc((1.12 - var(--react-brightness, 1.12)) * 1.9);
 }
 

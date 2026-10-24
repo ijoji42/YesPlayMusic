@@ -271,10 +271,10 @@ export default {
     // 语义已经改成「乘数」，漏掉基础值预览就会比实际页面暗一档。
     --react-base-brightness: 1.12;
     // 模糊半径由 --react-blur 提供，这里只做等比缩小。
+    // 亮度**不乘** --react-brightness，和歌词页保持同一套解耦：滤镜给质感，
+    // 暗幕给亮度呼吸。两层叠乘会把画面压到深色文字读不清的亮度。
     filter: blur(calc(var(--react-blur, 50px) * 0.2))
-      brightness(
-        calc(var(--react-base-brightness) * var(--react-brightness, 1))
-      )
+      brightness(var(--react-base-brightness))
       saturate(var(--react-saturate, 1));
     // 叠加视差：方向与歌词页近层一致（左上），幅度减半。
     // 位移必须和 blur 一样乘 0.2 做等比缩放：drift 是绝对像素值，直接用在
@@ -302,7 +302,8 @@ export default {
     z-index: 0;
     pointer-events: none;
     background: #000;
-    opacity: calc((1.12 - var(--react-brightness, 1.12)) * 1.35);
+    // 浅色档压到 0.66，理由同歌词页：全屏压暗会和深色文字抢对比度。
+    opacity: calc((1.12 - var(--react-brightness, 1.12)) * 0.66);
     transition: opacity 120ms linear;
   }
 
