@@ -390,8 +390,7 @@ export default {
         scale(calc(1 + var(--react-pulse, 0) * var(--react-power, 1) * 0.3));
       opacity: calc(
         (0.04 + var(--react-treble, 0) * 0.22 + var(--react-pulse, 0) * 0.16) *
-          var(--react-power, 1) *
-          var(--orb-gain, 1)
+          var(--react-power, 1) * var(--orb-gain, 1)
       );
     }
   }
