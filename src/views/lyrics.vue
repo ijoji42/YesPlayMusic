@@ -4,6 +4,7 @@
       class="lyrics-page"
       :class="{ 'no-lyric': noLyric }"
       :data-theme="theme"
+      :style="lyricsBaseStyle"
     >
       <div
         v-if="
@@ -18,14 +19,19 @@
           'reactive-background': settings.lyricsBackground === 'reactive',
         }"
       >
-        <div
-          class="top-right"
-          :style="{ backgroundImage: `url(${bgImageUrl})` }"
-        />
-        <div
-          class="bottom-left"
-          :style="{ backgroundImage: `url(${bgImageUrl})` }"
-        />
+        <!-- 模糊必须放在**内层**并向外扩：filter 如果加在「自己就是被裁切
+             的那一层」上，羽化区会被裁进视口，四周就出现一圈半透明的亮边
+             （浅色主题下就是那圈白晕）。详见 .bg-blur 的注释。 -->
+        <div class="bg-blur" :style="{ backgroundImage: `url(${bgImageUrl})` }">
+          <div
+            class="top-right"
+            :style="{ backgroundImage: `url(${bgImageUrl})` }"
+          />
+          <div
+            class="bottom-left"
+            :style="{ backgroundImage: `url(${bgImageUrl})` }"
+          />
+        </div>
       </div>
       <div
         v-if="settings.lyricsBackground === true"
@@ -393,6 +399,12 @@ export default {
       reactiveAccent: '',
       // 主色旋转 40° 后的互补色，给第二团光斑用，避免两团同色糊成一束追光。
       reactiveAccentAlt: '',
+      // 背景层的兜底色（"r, g, b"）。blur 的羽化在视口边缘一定会透出底色
+      // —— 因为 .lyrics-page 是 position: fixed，滤镜图层被裁在视口边界上，
+      // 外扩多少都没用。把底色设成「模糊后背景的平均色调」，羽化就混进
+      // 同色系里，不再是浅色主题下那圈刺眼的白晕。明暗各一套。
+      lyricsBaseLight: '',
+      lyricsBaseDark: '',
     };
   },
   computed: {
@@ -512,6 +524,17 @@ export default {
       if (this.reactiveAccent) style['--react-accent'] = this.reactiveAccent;
       if (this.reactiveAccentAlt) {
         style['--react-accent-alt'] = this.reactiveAccentAlt;
+      }
+      return style;
+    },
+    // 背景层兜底色。两套主题各给一个，CSS 里用 [data-theme] 挑。
+    lyricsBaseStyle() {
+      const style = {};
+      if (this.lyricsBaseLight) {
+        style['--lyrics-bg-base-light'] = `rgb(${this.lyricsBaseLight})`;
+      }
+      if (this.lyricsBaseDark) {
+        style['--lyrics-bg-base-dark'] = `rgb(${this.lyricsBaseDark})`;
       }
       return style;
     },
@@ -871,8 +894,10 @@ export default {
     },
     getCoverColor() {
       const mode = this.settings.lyricsBackground;
-      // 渐变背景和律动背景都需要主色：前者拿去拼渐变，后者拿去给光斑染色。
-      if (mode !== true && mode !== 'reactive') return;
+      // 渐变背景、律动背景、模糊/动态背景都需要主色：
+      // 前两者拿去拼渐变 / 给光斑染色，后两者拿去当背景层的兜底色
+      // （blur 的羽化在视口边缘会透出底色，见 .lyrics-background 的注释）。
+      if (mode === undefined || mode === null) return;
       const picUrl = this.currentTrack?.al?.picUrl;
       if (!picUrl) return;
       Vibrant.from(`${picUrl}?param=256y256`, { colorCount: 1 })
@@ -901,6 +926,14 @@ export default {
           this.reactiveAccentAlt = rgbString(
             originColor.rotate(40).lighten(0.18)
           );
+          // 兜底色要贴近「模糊后的背景」而不是封面本身。用 lighten/darken
+          // 这种相对量不行：封面明暗差别太大，深色封面提亮 0.42 之后仍然
+          // 比背景暗 30 多个色阶，羽化就从白晕变成了暗边。
+          // 直接锁 HSL 亮度：浅色主题的背景被 brightness(1.26) 提到 luma
+          // 200 上下（≈ HSL 82），深色主题被压到 0.72 的 luma 80（≈ 26）。
+          // 色相/饱和度仍然跟着封面走，所以边缘还是「这张专辑的颜色」。
+          this.lyricsBaseLight = rgbString(originColor.lightness(82));
+          this.lyricsBaseDark = rgbString(originColor.lightness(26));
         })
         .catch(() => {
           // 封面取色失败（跨域 / 无网络 / 调色板为空）时保持空串，
@@ -952,15 +985,52 @@ export default {
 }
 
 .lyrics-background {
+  // 这一层只负责定位，**既不带 filter 也不带 overflow: hidden**。
+  //
+  // overflow: hidden 是白晕的真正元凶：Chromium 会把带 filter 的后代图层
+  // 的边界与裁剪区求交，blur 的采样面因此被截断在视口边界上，羽化落进了
+  // 画面里 —— 视口边缘 41% 的像素是页面底色（实测把页面底色改黑，边缘
+  // 亮度变化 +104 个色阶，衰减宽度约 90px）。把外扩从 180px 加到 400px
+  // 完全无效，因为羽化发生在裁剪边界而不是元素边界。
+  // 改成 visible 之后同一测量降到 +2，视觉上就是零。
+  //
+  // 不裁切也不会漏：.lyrics-page 是 fixed inset:0，溢出视口的部分本来就
+  // 被视口裁掉，而 .bg-blur 是整页最底层，压不到任何 UI 上。
+  position: absolute;
+  inset: 0;
+  // 兜底色 = 模糊后背景的平均色调。blur 的羽化必然在视口边缘透出这一层，
+  // 用页面白底就会变成一圈白晕；用封面自己的色调，羽化就消失在同色系里。
+  background-color: var(--lyrics-bg-base-light, transparent);
+}
+
+[data-theme='dark'] .lyrics-background {
+  background-color: var(--lyrics-bg-base-dark, transparent);
+}
+
+.bg-blur {
+  // 外扩 200px（> 3σ；blur 上限 50px，σ 就等于 50px，羽化尾巴伸到 2~3σ）。
+  //
+  // 为什么必须拆成两层：filter 加在「自己就是被裁切的那一层」上时，羽化
+  // 发生在**裁切边界**而不是元素边界 —— 实测把外扩从 180px 加到 400px
+  // 完全没有变化，边缘透底量一直稳定在 +105 个色阶，衰减宽度约 90px。
+  // 拆成子层之后，子层边界在裁切区外 200px，羽化被裁掉，视口内的边缘
+  // 不再半透明，底下的页面底色也就透不上来。
+  //
+  // 顺带修掉一个更隐蔽的问题：原来父层是空的，只有两个 opacity: .6 的
+  // 子层，重叠区合成 alpha 只有 1-(1-.6)² = 0.84 —— 16% 的页面底色均匀
+  // 透上来，整片背景被洗淡（实测 +37 个色阶）。现在封面图铺在 .bg-blur
+  // 自己身上，alpha = 1。
+  --bg-bleed: 200px;
+  position: absolute;
+  top: calc(-1 * var(--bg-bleed));
+  left: calc(-1 * var(--bg-bleed));
+  width: calc(100% + var(--bg-bleed) * 2);
+  height: calc(100% + var(--bg-bleed) * 2);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
   filter: blur(50px) contrast(var(--contrast-lyrics-background))
     brightness(var(--brightness-lyrics-background));
-  // 向外扩 6%：blur 的采样边界落在视口之外，四周不会出现一圈被滤镜
-  // 稀释过的暗边；同时尺寸和 .gradient-background 保持一致，切模式不跳动。
-  position: absolute;
-  top: -6vh;
-  left: -6vw;
-  height: 112vh;
-  width: 112vw;
 
   .top-right,
   .bottom-left {
@@ -986,7 +1056,8 @@ export default {
   }
 }
 
-.dynamic-background > div {
+.dynamic-background .top-right,
+.dynamic-background .bottom-left {
   animation: rotate 150s linear infinite;
 }
 
@@ -1001,9 +1072,9 @@ export default {
   --react-base-brightness: 1.26;
   --react-base-contrast: 0.92;
 
-  // 光斑是 ::after 的替代者，背景本身不再需要裁切边界；保留 overflow
-  // 是为了让 blur 的采样不溢出到歌词文字上。
-  overflow: hidden;
+  // 注意：这里**不能**再写 overflow: hidden。它会把 .bg-blur 的模糊采样面
+  // 截断在视口边界，四周出现一圈半透明亮边（浅色主题就是白晕）。详见
+  // .lyrics-background 的注释。
 
   // 去掉了 hue-rotate：整片背景跟着能量整体换色，是最强的「廉价」信号，
   // 也是用户说的「杀马特」感的来源。现在只保留清晰度 / 明度 / 饱和度三个维度。
@@ -1016,6 +1087,12 @@ export default {
   // 基础亮度 1.26 不是随手调的：暗幕压暗之后还要保住「高潮态背景 luma ≥ 110」，
   // 底子不够亮就没有压暗的余量。1.26 时安静态整帧 luma 135.8（和 team-lead
   // 已经认可的那版 135.2 基本一致），高潮态 115，两边都达标。
+  //
+  // 自定义属性放在这一层，由 .bg-blur 继承 —— filter 本身必须落在 .bg-blur
+  // 上（不能落在这个被裁切的层上），否则羽化会被裁进视口。
+}
+
+.lyrics-background.reactive-background .bg-blur {
   filter: blur(var(--react-blur, 50px)) contrast(var(--react-base-contrast))
     brightness(var(--react-base-brightness)) saturate(var(--react-saturate, 1));
   // 160ms + ease-out：原来 80ms linear 每帧都在「跳」，没有惯性。
@@ -1261,6 +1338,11 @@ export default {
 //    平均色，噪声彻底消失。160px = SVG 固有尺寸，1 纹素正好 1 设备像素。
 // 4. **rect 用 100% 而不是写死 160**，DPR ≠ 1 时才不会被二次缩放。
 //
+// 5. **`image-rendering: pixelated` 是必须的**。DPR > 1 时 `background-size:
+//    160px` 会被双线性放大：纹素被插值抹平，σ 掉三成、lag-1 从 0 升到 +0.3，
+//    抖动能力跟着打折。用户 150% 缩放的笔记本正好踩这一档。nearest 放大后
+//    每个纹素变成 1.5~2 个设备像素的硬块，σ 原样保住。
+//
 // 层级：z-index 0 盖在 .lyrics-background / .gradient-background（同为 0，
 // 但 DOM 顺序在前）之上，在 .left-side（z-index 1）和 .right-side
 // （z-index 0，DOM 顺序在后）之下，所以任何文字都不会被噪声覆盖。
@@ -1269,20 +1351,22 @@ export default {
   inset: 0;
   z-index: 0;
   pointer-events: none;
-  opacity: 0.08;
+  // 0.08 是错的。抖动的幅度必须和量化步长（1 个色阶）同量级才溶解得掉色带：
+  // σ ≈ 0.9 时只有不到两成像素跨过台阶，边界依然是一条线，肉眼照看不误。
+  // 实测 σ ≈ 1.9~2.2 才真正把 1 级台阶打散，而这个值正好压在颗粒可见门槛
+  // （≈2.1）上 —— 抖动本来就该是这个量级，之前「压低到看不见」的取舍搞反了。
+  opacity: 0.13;
   mix-blend-mode: normal;
+  image-rendering: pixelated;
   background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n' color-interpolation-filters='sRGB'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.86' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   background-repeat: repeat;
   background-size: 160px 160px;
 }
 
-// 深色主题单独降一档：`normal` 的均值偏移是 `a·(128 − base)`，深色背景
-// base ≈ 18，同样 opacity 的黑位抬升是浅色的三倍。0.06 时黑位 18.2 → 21.4
-// （+3.2 个色阶，均匀无结构），噪声 σ ≈ 1.1 个色阶，远低于可见颗粒的
-// 门槛（实测 σ ≈ 2.1 才开始看得见）。
-[data-theme='dark'] .lyrics-grain {
-  opacity: 0.06;
-}
+// 深色主题不再单独降档。`normal` 的均值偏移是 `a·(mean − base)`，深色
+// base 低所以偏移更大（0.13 时黑位 +6~7 个色阶）——这点抬升反而帮了暗部：
+// 低亮度可用的色阶本来就少，抬一点能多出几档。真正的代价是暗部变灰，
+// 0.13 时仍在可接受范围，再高就该用补偿层了。
 
 .left-side {
   flex: 1;

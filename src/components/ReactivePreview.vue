@@ -412,15 +412,18 @@ export default {
     inset: 0;
     z-index: 0;
     pointer-events: none;
-    opacity: 0.08;
+    // 与 lyrics.vue 的 .lyrics-grain 保持一致：抖动幅度必须与 1 个色阶同量级
+    opacity: 0.13;
     mix-blend-mode: normal;
+    image-rendering: pixelated;
     background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n' color-interpolation-filters='sRGB'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.86' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
     background-repeat: repeat;
     background-size: 160px 160px;
   }
 
   [data-theme='dark'] & .react-grain {
-    opacity: 0.06;
+    // 深色不再降档，理由同 lyrics.vue：压低抖动幅度 = 色带回来
+    opacity: 0.13;
   }
 
   .badge {
